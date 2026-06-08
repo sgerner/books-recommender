@@ -1,0 +1,122 @@
+{
+  "db_path": "/workspace/books_recommender/data/books.db",
+  "vault_path": "/workspace/obsidian/Media/Books",
+  "goodreads_rss_url": "https://www.goodreads.com/review/list_rss/5506302?shelf=read",
+  "librarr": {
+    "url": "http://librarr:5050",
+    "wishlist_media_type": "audiobook"
+  },
+  "discord": {
+    "enabled": false,
+    "channel_id": null,
+    "post_hour_utc": 15,
+    "post_weekday": 1
+  },
+  "sources": [
+    {
+      "name": "nyt",
+      "kind": "nyt-api",
+      "url": "https://api.nytimes.com/svc/books/v3/lists/overview.json",
+      "enabled": true,
+      "weight": 0.25,
+      "media_type": "audiobook",
+      "config": {}
+    },
+    {
+      "name": "goodreads-science-fiction",
+      "kind": "web",
+      "url": "https://www.goodreads.com/genres/science-fiction",
+      "enabled": true,
+      "weight": 0.2,
+      "media_type": "audiobook",
+      "config": {}
+    },
+    {
+      "name": "goodreads-dystopian",
+      "kind": "web",
+      "url": "https://www.goodreads.com/genres/dystopian",
+      "enabled": true,
+      "weight": 0.18,
+      "media_type": "audiobook",
+      "config": {}
+    },
+    {
+      "name": "goodreads-speculative-fiction",
+      "kind": "web",
+      "url": "https://www.goodreads.com/genres/speculative-fiction",
+      "enabled": true,
+      "weight": 0.2,
+      "media_type": "audiobook",
+      "config": {}
+    },
+    {
+      "name": "goodreads-mystery-thriller",
+      "kind": "web",
+      "url": "https://www.goodreads.com/genres/mystery-thriller",
+      "enabled": true,
+      "weight": 0.18,
+      "media_type": "audiobook",
+      "config": {}
+    },
+    {
+      "name": "goodreads-literary-fiction",
+      "kind": "web",
+      "url": "https://www.goodreads.com/genres/literary-fiction",
+      "enabled": true,
+      "weight": 0.17,
+      "media_type": "audiobook",
+      "config": {}
+    }
+  ],
+  "source_weights": {
+    "nyt": 0.25,
+    "goodreads-science-fiction": 0.2,
+    "goodreads-dystopian": 0.18,
+    "goodreads-speculative-fiction": 0.2,
+    "goodreads-mystery-thriller": 0.18,
+    "goodreads-literary-fiction": 0.17,
+    "goodreads": 0.35,
+    "nyt-books": 0.55,
+    "blog": 0.45,
+    "rss": 0.4
+  },
+  "nyt": {
+    "api_key": null,
+    "api_key_env": "NYT_API_KEY"
+  },
+  "embeddings": {
+    "enabled": true,
+    "model": "qwen3-embedding:4b",
+    "base_url": "http://ollama:11434",
+    "batch_size": 16,
+    "candidate_weight": 0.4,
+    "book_weight": 0.45
+  },
+  "recommendation": {
+    "top_n": 10,
+    "minimum_score": 69,
+    "profile_refresh": "monthly",
+    "rating_signals": {
+      "1": -2.0,
+      "2": -1.0,
+      "3": 0.0,
+      "4": 1.0,
+      "5": 2.25
+    },
+    "time_decay_half_life_years": 4,
+    "banned_format_terms": [
+      "graphic novel",
+      "graphic-novel",
+      "graphic novels",
+      "graphic-novels",
+      "manga",
+      "manhwa",
+      "manhua",
+      "webcomic",
+      "web comics",
+      "web-comic"
+    ],
+    "series_negative_penalty": 0.22,
+    "series_positive_bonus": 0.05
+  }
+}

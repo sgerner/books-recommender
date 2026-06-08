@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+secrets.json
+data/
+*.bak-
+*.bak-*
+.env
