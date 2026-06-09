@@ -75,6 +75,15 @@
       "weight": 0.2,
       "media_type": "audiobook",
       "config": {}
+    },
+    {
+      "name": "openlibrary-trending",
+      "kind": "openlibrary",
+      "url": "https://openlibrary.org/trending/weekly.json?limit=100",
+      "enabled": true,
+      "weight": 0.15,
+      "media_type": "audiobook",
+      "config": {}
     }
   ],
   "source_weights": {
@@ -85,6 +94,7 @@
     "goodreads-mystery-thriller": 0.18,
     "goodreads-literary-fiction": 0.17,
     "apple-top-audiobooks": 0.2,
+    "openlibrary-trending": 0.15,
     "goodreads": 0.35,
     "nyt-books": 0.55,
     "blog": 0.45,

@@ -405,6 +405,39 @@ def discover_source_items(source: dict[str, Any], cfg: dict[str, Any]) -> Source
                     })
             return SourceFetchResult(source=source, items=out, content_hash=digest)
 
+        if kind in {'openlibrary', 'open-library'} or 'openlibrary.org' in url.lower():
+            data, digest, raw = _fetch_json_snapshot(url)
+            if digest == (source.get('last_hash') or ''):
+                return SourceFetchResult(source=source, items=[], content_hash=digest, skipped=True, reason='unchanged OpenLibrary data')
+            works = data.get('works', []) if isinstance(data, dict) else []
+            out: list[dict[str, Any]] = []
+            for idx, work in enumerate(works, 1):
+                title = work.get('title') or ''
+                author_list = work.get('author_name') or []
+                author = author_list[0] if author_list else ''
+                work_key = work.get('key', '')
+                work_url = f'https://openlibrary.org{work_key}' if work_key else ''
+                cover_id = work.get('cover_i')
+                cover_url = f'https://covers.openlibrary.org/b/id/{cover_id}-M.jpg' if cover_id else ''
+                year = work.get('first_publish_year')
+                published_at = f'{year}-01-01T00:00:00Z' if year else ''
+                series_list = work.get('series_name') or []
+                series = series_list[0] if series_list else ''
+                edition_key = work.get('cover_edition_key') or ''
+                out.append({
+                    'title': title,
+                    'author': author,
+                    'url': work_url,
+                    'cover_url': cover_url,
+                    'description': '',
+                    'published_at': published_at,
+                    'media_type': source.get('media_type', 'audiobook'),
+                    'raw': {'openlibrary': work},
+                    'source_meta': {'strategy': 'openlibrary', 'rank': idx, 'edition_key': edition_key, 'series': series},
+                    'source_uid': f'ol:{work_key}',
+                })
+            return SourceFetchResult(source=source, items=out, content_hash=digest)
+
         # Generic web article/page handling.
         html_blob, digest = _fetch_html_snapshot(url)
         if digest == (source.get('last_hash') or ''):
