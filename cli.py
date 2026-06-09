@@ -8,6 +8,7 @@ from pathlib import Path
 from .config import load_config, resolve_librarr_api_key
 from .db import connect, get_books, get_candidates, get_embeddings_map, get_book_title_author_keys, init_db, record_feedback, set_candidate_status, upsert_candidate, upsert_source, dedupe_books_by_title_author, get_source, normalize_book_key, normalize_candidate_match_key
 from .embeddings import EmbeddingItem, candidate_text, sync_embeddings, text_hash as embedding_text_hash, blob_to_vector
+from .enrichment import enrich_book_metadata
 from .goodreads import sync_goodreads_rss
 from .librarr import LibrarrClient
 from .obsidian import import_obsidian, book_text
@@ -526,6 +527,83 @@ def _active_candidate_rows(conn):
     return list(conn.execute("SELECT * FROM candidates WHERE status='new' ORDER BY updated_at DESC"))
 
 
+def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str, int]:
+    """Enrich candidates with missing metadata via Goodreads/OpenLibrary fallback.
+
+    Only enriches candidates that are missing pages, genres, or series.
+    Rate-limited to avoid hitting API limits.
+    """
+    enrich_cfg = cfg.get('enrichment', {})
+    if not enrich_cfg.get('enabled', True):
+        return {'skipped': True, 'enriched': 0, 'failed': 0}
+
+    enriched = 0
+    failed = 0
+    delay = enrich_cfg.get('delay', 2.0)
+    max_enrichments = enrich_cfg.get('max_per_run', 15)
+
+    for candidate in candidates[:max_enrichments]:
+        raw = candidate.get('raw') or {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        # Skip if already enriched (has pages or genres in raw metadata).
+        if raw.get('pages') or raw.get('genres'):
+            continue
+
+        goodreads_id = raw.get('goodreads_id')
+        isbn = raw.get('isbn') or candidate.get('isbn13')
+
+        try:
+            meta = enrich_book_metadata(
+                title=candidate.get('title', ''),
+                author=candidate.get('author', ''),
+                goodreads_id=goodreads_id,
+                isbn=isbn,
+                delay=delay,
+            )
+        except Exception:
+            failed += 1
+            continue
+
+        if meta.get('provider') == 'none':
+            failed += 1
+            continue
+
+        # Merge enriched metadata into candidate's raw dict.
+        enriched_data = {}
+        if meta.get('pages'):
+            enriched_data['pages'] = meta['pages']
+        if meta.get('series'):
+            enriched_data['series'] = meta['series']
+        if meta.get('genres'):
+            enriched_data['genres'] = meta['genres']
+        if meta.get('isbn13'):
+            enriched_data['isbn13'] = meta['isbn13']
+        if meta.get('language'):
+            enriched_data['language'] = meta['language']
+        if meta.get('first_published'):
+            enriched_data['first_published'] = meta['first_published']
+        if meta.get('cover_url') and not candidate.get('cover_url'):
+            enriched_data['cover_url'] = meta['cover_url']
+        if meta.get('author') and not candidate.get('author'):
+            enriched_data['resolved_author'] = meta['author']
+        enriched_data['enrichment_provider'] = meta.get('provider', 'unknown')
+
+        if enriched_data:
+            raw.update(enriched_data)
+            conn.execute(
+                'UPDATE candidates SET raw_json=?, cover_url=coalesce(?, cover_url) WHERE id=?',
+                (json.dumps(raw, ensure_ascii=False), meta.get('cover_url'), candidate['id']),
+            )
+            enriched += 1
+
+    if enriched:
+        conn.commit()
+
+    return {'enriched': enriched, 'failed': failed, 'total_checked': len(candidates[:max_enrichments])}
+
+
 def _retire_low_scoring_candidates(conn, changed, cfg) -> dict[str, int]:
     rec_cfg = cfg.get('recommendation', {})
     threshold = int(rec_cfg.get('minimum_score', 82))
@@ -545,10 +623,17 @@ def _retire_low_scoring_candidates(conn, changed, cfg) -> dict[str, int]:
     return {'minimum_score': threshold, 'excluded': sum(1 for _, s in changed if int(s.get('score', 0)) < threshold)}
 
 
-def _score_pending(conn, cfg, *, sync_books: bool = True, explain: bool = False):
+def _score_pending(conn, cfg, *, sync_books: bool = True, explain: bool = False, enrich: bool = False):
     if sync_books:
         _sync_book_embeddings(conn, cfg)
     _dedupe_candidates(conn)
+
+    # Enrich candidates missing metadata before scoring (digest mode).
+    if enrich:
+        candidate_rows_for_enrich = _active_candidate_rows(conn)
+        if candidate_rows_for_enrich:
+            _enrich_candidates(conn, candidate_rows_for_enrich, cfg)
+
     profile = build_profile(_book_rows(conn), conn=conn, embedding_cfg=cfg.get('embeddings', {}))
     source_weights = cfg.get('source_weights', {})
     changed = []
@@ -599,15 +684,27 @@ def cmd_digest(args):
     cfg = load_config(args.config)
     conn = connect(cfg['db_path'])
     init_db(conn)
-    # Weekly digest should use cached book embeddings/profile inputs. Nightly handles
+    # Weekly digest: enrich missing metadata (Goodreads/OpenLibrary fallback),
+    # use cached book embeddings/profile inputs. Nightly handles
     # new candidate embeddings and low-score retirement.
-    profile, changed = _score_pending(conn, cfg, sync_books=False, explain=True)
+    profile, changed = _score_pending(conn, cfg, sync_books=False, explain=True, enrich=True)
     # Filter out candidates whose title+author match an existing book.
     book_keys = _candidate_match_keys(conn)
     changed = [(c, s) for c, s in changed if normalize_candidate_match_key(c.get('title', ''), c.get('author', '')) not in book_keys]
     rows = sorted(changed, key=lambda x: x[1]['score'], reverse=True)[: args.limit]
-    if not rows:
+
+    # Sanity check: alert if too few candidates scored.
+    total_active = len(changed)
+    if total_active < args.min_candidates:
+        alert = f'WARNING: Only {total_active} candidates scored (threshold: {args.min_candidates}). Pipeline may need attention.'
+        if args.format == 'json':
+            print(json.dumps({'alert': alert, 'total_scored': total_active, 'min_required': args.min_candidates, 'top': []}))
+        else:
+            print(f'# Weekly Book Recommendations')
+            print()
+            print(f'> {alert}')
         return
+
     if args.format == 'json':
         print(json.dumps([{
             'id': c['id'], 'title': c['title'], 'author': c['author'], 'score': s['score'], 'reasons': s['reasons'], 'status': c['status'],
@@ -622,6 +719,10 @@ def cmd_digest(args):
         print(f"Candidate ID: {c['id']}")
         if c.get('url'):
             print(f"URL: {c['url']}")
+        # Show enrichment source if available.
+        raw = c.get('raw') or {}
+        if isinstance(raw, dict) and raw.get('enrichment_provider'):
+            print(f"Enriched via: {raw['enrichment_provider']}")
         if s['reasons']:
             print('Why:')
             for reason in s['reasons']:
@@ -736,6 +837,7 @@ def build_parser():
     s = sub.add_parser('digest')
     s.add_argument('--limit', type=int, default=10)
     s.add_argument('--format', choices=['markdown', 'json'], default='markdown')
+    s.add_argument('--min-candidates', type=int, default=3, help='Alert if fewer than this many candidates scored')
     s.set_defaults(func=cmd_digest)
 
     s = sub.add_parser('approve')

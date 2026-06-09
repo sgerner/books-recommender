@@ -186,11 +186,29 @@ def _candidate_from_anchor(link: dict[str, str], page_text: str, html_blob: str,
     if href_idx >= 0:
         snippet = html_blob[max(0, href_idx - 220): href_idx + 420]
         snippet_text = html_to_text(snippet)
-        m = re.search(r'\bby\s+([A-Z][^|\n\r<]{2,80})', snippet_text)
+        # Author extraction: match name parts (full words, initials, or dotted sequences like N.K.).
+        # Separated by spaces or hyphens (for compound names like Smith-Jones).
+        # This prevents crossing sentence boundaries or HTML tag remnants.
+        WORD = r'[A-Z][\w\u00C0-\u024F]+'
+        INITIAL = r'[A-Z]\.'
+        INITIAL_SEQ = r'[A-Z](?:\.[A-Z])+\.?'
+        PART = f'(?:{INITIAL_SEQ}|{WORD}|{INITIAL})'
+        m = re.search(r'\bby\s+(' + PART + r'(?:[\s-]+' + PART + r')*)', snippet_text)
         if m:
             author = m.group(1).strip()
-            author = re.split(r'\s*\(|\s{2,}|[–—:|.]', author, maxsplit=1)[0].strip()
-            candidate['author'] = author
+            # Truncate at em-dash, en-dash, colon, open paren.
+            author = re.split(r'\s*—\s*|\s*–\s*|\s*:\s*|\s*\(', author, maxsplit=1)[0].strip()
+            author = re.sub(r'\s+', ' ', author)
+            # Reject sentence fragments and invalid names.
+            author_lower = author.lower()
+            if any(w in author_lower for w in (' the ', ' and ', ' with ', ' for ', ' from ', ' in ', ' of ')):
+                author = ''
+            elif len(author) < 2 or not re.search(r'[A-Za-z]{2,}', author):
+                author = ''
+            elif re.search(r'[<>{}]', author) or '&amp;' in author or '&lt;' in author:
+                author = ''
+            if author:
+                candidate['author'] = author
     return _normalize_candidate(candidate, source, f"anchor:{index}:{slugify(text) or 'book'}")
 
 
@@ -405,12 +423,22 @@ def discover_source_items(source: dict[str, Any], cfg: dict[str, Any]) -> Source
                 line = line.strip()
                 if len(line) < 8:
                     continue
-                m = re.match(r'^(.*?)\s+(?:by|—|–|-|: )\s+([^|]{2,80})$', line, re.I)
+                # More restrictive: title must be at least 2 words, author must be capitalized.
+                m = re.match(r'^(.{4,120}?)\s+(?:by|—|–|-|:)\s+([A-Z][a-zA-Z\u00C0-\u024F][\w\u00C0-\u024F\s]{1,60})$', line, re.I)
                 if not m:
                     continue
                 title = m.group(1).strip(' -–—:')
                 author = m.group(2).strip(' -–—:')
-                if len(title.split()) < 2:
+                # Reject titles that are too short or look like fragments.
+                if len(title.split()) < 2 or len(title) < 4:
+                    continue
+                # Reject authors that look like sentence fragments.
+                author_lower = author.lower()
+                if any(w in author_lower for w in (' the ', ' and ', ' with ', ' for ', ' from ')):
+                    continue
+                # Clean up trailing punctuation from author.
+                author = re.sub(r'[.,;!?]+$', '', author).strip()
+                if len(author) < 2 or not re.search(r'[A-Za-z]{2,}', author):
                     continue
                 items.append(_normalize_candidate({
                     'title': title,

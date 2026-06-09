@@ -36,6 +36,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'candidate_weight': 0.4,
         'book_weight': 0.45,
     },
+    'enrichment': {
+        'enabled': True,
+        'delay': 2.0,
+        'max_per_run': 15,
+    },
     'discord': {
         'enabled': False,
         'token_env': 'DISCORD_BOT_TOKEN',
