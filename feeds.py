@@ -16,7 +16,7 @@ from .text import html_to_text
 BOOK_URL_RE = re.compile(r"https?://www\.goodreads\.com/book/show/(\d+)[^\"'\s<>]*", re.I)
 ALT_RE = re.compile(r"alt=[\"']([^\"']+)[\"']", re.I)
 HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.I)
-AUTHOR_RE = re.compile(r"author:\s*(.+?)(?:\s{2,}|\s+rating:|$)", re.I | re.S)
+AUTHOR_RE = re.compile(r"author:\s*(.+?)(?:\s{2,}|\s+name:|\s+rating:|$)", re.I | re.S)
 
 
 def fetch_url(url: str, timeout: int = 30) -> tuple[bytes, str | None]:
@@ -84,12 +84,19 @@ def parse_feed(url: str) -> list[dict[str, Any]]:
 
 
 def parse_item(item: ET.Element) -> dict[str, Any]:
+    title = _child_text(item, 'title') or ''
+    # Collect all <category> texts (some feeds put author as first category)
+    categories = []
+    for child in list(item):
+        if _local_name(child.tag) == 'category' and child.text:
+            categories.append(child.text.strip())
     return {
-        'title': _child_text(item, 'title') or '',
+        'title': title,
         'link': _child_text(item, 'link') or '',
         'guid': _child_text(item, 'guid') or _child_text(item, 'id') or '',
         'summary_html': _child_text(item, 'description') or _child_text(item, 'encoded') or '',
         'published_at': parse_datetime(_child_text(item, 'pubdate') or _child_text(item, 'date')),
+        'categories': categories,
         'raw': {child.tag: child.text for child in list(item)},
     }
 
@@ -147,6 +154,28 @@ def extract_goodreads_book_refs(html_blob: str) -> list[dict[str, str]]:
     return out
 
 
+def _split_title_author(title: str) -> tuple[str, str]:
+    """Split 'Title - Author' or 'Title: Subtitle - Author' patterns.
+    Returns (title, author). Only splits on ' - ' when the part after looks
+    like a person name (starts with capital, no lowercase after space, etc.)."""
+    if ' - ' not in title:
+        return title, ''
+    # Try splitting on last ' - ' first (handles subtitles with hyphens)
+    parts = title.rsplit(' - ', 1)
+    if len(parts) == 2:
+        candidate_author = parts[1].strip()
+        # Heuristic: author part should look like a name
+        # - Starts with uppercase letter
+        # - No more than 4 words (most authors are 1-3 words)
+        # - Doesn't look like a subtitle (no "A Novel", "A Story", etc.)
+        if (candidate_author
+                and candidate_author[0].isupper()
+                and len(candidate_author.split()) <= 4
+                and not re.match(r'(?i)^(a|an|the)\s', candidate_author)):
+            return parts[0].strip(), candidate_author
+    return title, ''
+
+
 def normalized_feed_items(url: str) -> list[dict[str, Any]]:
     items = parse_feed(url)
     out: list[dict[str, Any]] = []
@@ -157,5 +186,28 @@ def normalized_feed_items(url: str) -> list[dict[str, Any]]:
             for ref in refs:
                 out.append({**item, **ref})
         else:
-            out.append({**item, 'goodreads_id': '', 'author': '', 'url': item.get('link') or ''})
+            # Extract author from categories (first category is often the author)
+            author = ''
+            categories = item.get('categories') or []
+            if categories:
+                author = categories[0]
+
+            # If still no author, try splitting "Title - Author" from title
+            title = item.get('title', '')
+            if not author and ' - ' in title:
+                split_title, split_author = _split_title_author(title)
+                if split_author:
+                    title = split_title
+                    author = split_author
+
+            # Use summary_html as clean title if it exists and is shorter
+            clean_title = desc if desc and len(desc) < len(title) else title
+
+            out.append({
+                **item,
+                'title': clean_title,
+                'author': author,
+                'goodreads_id': '',
+                'url': item.get('link') or '',
+            })
     return out

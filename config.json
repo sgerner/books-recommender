@@ -66,6 +66,15 @@
       "weight": 0.17,
       "media_type": "audiobook",
       "config": {}
+    },
+    {
+      "name": "apple-top-audiobooks",
+      "kind": "rss",
+      "url": "https://rss.marketingtools.apple.com/api/v2/us/audio-books/top/50/audio-books.rss",
+      "enabled": true,
+      "weight": 0.2,
+      "media_type": "audiobook",
+      "config": {}
     }
   ],
   "source_weights": {
@@ -75,6 +84,7 @@
     "goodreads-speculative-fiction": 0.2,
     "goodreads-mystery-thriller": 0.18,
     "goodreads-literary-fiction": 0.17,
+    "apple-top-audiobooks": 0.2,
     "goodreads": 0.35,
     "nyt-books": 0.55,
     "blog": 0.45,
