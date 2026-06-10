@@ -173,14 +173,14 @@ def _format_recommendation(candidate: dict[str, Any], scored: dict[str, Any]) ->
 def _build_digest_candidates(conn, cfg: dict[str, Any], limit: int) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], str | None, int]:
     # Weekly digest mode: enrich missing metadata, score pending items, and
     # filter out anything that already matches an existing book.
-    from .cli import _candidate_match_keys, _score_pending, normalize_candidate_match_key
+    from .cli import _candidate_match_keys, _score_pending, normalize_candidate_match_key, candidate_match_keys
 
     _, changed = _score_pending(conn, cfg, sync_books=False, explain=True, enrich=True)
     book_keys = _candidate_match_keys(conn)
     filtered = [
         (candidate, scored)
         for candidate, scored in changed
-        if normalize_candidate_match_key(candidate.get("title", ""), candidate.get("author", "")) not in book_keys
+        if not (candidate_match_keys(candidate.get("title", ""), candidate.get("author", ""), candidate.get("source", "")) & book_keys)
     ]
     filtered.sort(key=lambda x: x[1].get("score", 0), reverse=True)
     rows = filtered[:limit]

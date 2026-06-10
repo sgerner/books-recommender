@@ -502,6 +502,17 @@ class TestDiscordWorkflow:
         assert decision == 'reject'
         assert counts[THUMBS_DOWN] == 2
 
+    def test_apple_audiobook_title_matches_canonical_library_row(self):
+        from books_recommender.db import candidate_match_keys, normalize_candidate_match_key
+
+        book_key = normalize_candidate_match_key("Carl's Doomsday Scenario (Dungeon Crawler Carl, #2)", 'Matt Dinniman')
+        apple_keys = candidate_match_keys(
+            "Carl's Doomsday Scenario: Dungeon Crawler Carl, Book 2 (Unabridged)",
+            'Matt Dinniman',
+            'apple-top-audiobooks',
+        )
+        assert book_key in apple_keys
+
     def test_sync_reactions_marks_approved_and_posts_to_librarr(self):
         from books_recommender.discord_workflow import sync_reactions, THUMBS_UP
         from books_recommender.db import upsert_discord_message

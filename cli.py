@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_config, resolve_librarr_api_key
-from .db import connect, get_books, get_candidates, get_embeddings_map, get_book_title_author_keys, init_db, record_feedback, set_candidate_status, upsert_candidate, upsert_source, dedupe_books_by_title_author, get_source, normalize_book_key, normalize_candidate_match_key
+from .db import connect, get_books, get_candidates, get_embeddings_map, get_book_title_author_keys, init_db, record_feedback, set_candidate_status, upsert_candidate, upsert_source, dedupe_books_by_title_author, get_source, normalize_book_key, normalize_candidate_match_key, candidate_match_keys
 from .discord_workflow import cmd_discord_post, cmd_discord_sync_reactions
 from .embeddings import EmbeddingItem, candidate_text, sync_embeddings, text_hash as embedding_text_hash, blob_to_vector
 from .enrichment import enrich_book_metadata
@@ -509,7 +509,7 @@ def _dedupe_candidates(conn) -> dict[str, int]:
     removed_library_matches = 0
     removed_duplicate_rows = 0
     for key, group in groups.items():
-        if key in book_keys:
+        if any(candidate_match_keys(r.get('title') or '', r.get('author') or '', r.get('source') or '') & book_keys for r in group):
             delete_ids.extend(int(r['id']) for r in group)
             removed_library_matches += len(group)
             continue

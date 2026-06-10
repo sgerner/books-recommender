@@ -486,6 +486,27 @@ def normalize_candidate_match_key(title: str, author: str) -> str:
     return f'{re.sub(r"\s+", " ", t).strip()}||{a}'
 
 
+def candidate_match_keys(title: str, author: str, source: str = '') -> set[str]:
+    """Return candidate match key variants for library dedupe/filtering.
+
+    Apple audiobooks often encode a canonical title plus a marketing / series
+    suffix after a colon, so we include a source-specific prefix variant there.
+    This keeps the broader normalization conservative for other sources.
+    """
+    keys = {normalize_candidate_match_key(title, author)}
+    source_name = (source or '').strip().lower()
+    if source_name == 'apple-top-audiobooks':
+        title_norm = re.sub(r'\s+', ' ', (title or '').strip())
+        if ':' in title_norm:
+            prefix = title_norm.split(':', 1)[0].strip()
+            if prefix:
+                keys.add(normalize_candidate_match_key(prefix, author))
+        stripped = re.sub(r'\s*,\s*(?:book|vol\.?|volume|part|chapter)\s*\d+[\w\.-]*.*$', '', title_norm, flags=re.I).strip()
+        if stripped and stripped != title_norm:
+            keys.add(normalize_candidate_match_key(stripped, author))
+    return keys
+
+
 def get_book_title_author_keys(conn: sqlite3.Connection) -> set[str]:
     """Return a set of normalized title||author keys for all books."""
     rows = conn.execute('SELECT title, author FROM books').fetchall()
