@@ -276,6 +276,13 @@ class TestCLIDigest:
             entity_type TEXT, entity_id INTEGER, model TEXT,
             text_hash TEXT, dim INTEGER, vector_blob BLOB
         )''')
+        conn.execute('''CREATE TABLE discord_messages (
+            id INTEGER PRIMARY KEY,
+            candidate_id INTEGER UNIQUE,
+            channel_id TEXT, message_id TEXT UNIQUE, content TEXT,
+            status TEXT DEFAULT 'posted', reaction TEXT, reaction_counts_json TEXT,
+            librarr_id TEXT, posted_at TEXT, reacted_at TEXT, updated_at TEXT
+        )''')
         conn.execute('''CREATE TABLE events (
             id INTEGER PRIMARY KEY,
             kind TEXT, payload_json TEXT, created_at TEXT
@@ -442,3 +449,156 @@ class TestCandidateBanned:
             'tags': [], 'themes': [],
         }
         assert candidate_is_banned(candidate) is True
+
+
+class TestDiscordWorkflow:
+    def _make_db(self):
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute('''CREATE TABLE candidates (
+            id INTEGER PRIMARY KEY,
+            source TEXT, source_uid TEXT, title TEXT, author TEXT,
+            url TEXT, cover_url TEXT, media_type TEXT, published_at TEXT,
+            description TEXT, raw_json TEXT, score REAL, score_breakdown TEXT,
+            status TEXT DEFAULT 'new', librarr_id TEXT, decided_at TEXT,
+            created_at TEXT, updated_at TEXT,
+            UNIQUE(source, source_uid)
+        )''')
+        conn.execute('''CREATE TABLE discord_messages (
+            id INTEGER PRIMARY KEY,
+            candidate_id INTEGER UNIQUE,
+            channel_id TEXT, message_id TEXT UNIQUE, content TEXT,
+            status TEXT DEFAULT 'posted', reaction TEXT, reaction_counts_json TEXT,
+            librarr_id TEXT, posted_at TEXT, reacted_at TEXT, updated_at TEXT
+        )''')
+        conn.execute('''CREATE TABLE feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER, action TEXT, note TEXT, channel TEXT, created_at TEXT
+        )''')
+        conn.commit()
+        return conn
+
+    def test_reaction_decision_prefers_up(self):
+        from books_recommender.discord_workflow import _reaction_decision, THUMBS_UP, THUMBS_DOWN
+
+        decision, counts = _reaction_decision({
+            'reactions': [
+                {'emoji': {'name': THUMBS_UP}, 'count': 2},
+                {'emoji': {'name': THUMBS_DOWN}, 'count': 1},
+            ]
+        })
+        assert decision == 'approve'
+        assert counts[THUMBS_UP] == 2
+
+    def test_reaction_decision_prefers_down(self):
+        from books_recommender.discord_workflow import _reaction_decision, THUMBS_UP, THUMBS_DOWN
+
+        decision, counts = _reaction_decision({
+            'reactions': [
+                {'emoji': {'name': THUMBS_UP}, 'count': 1},
+                {'emoji': {'name': THUMBS_DOWN}, 'count': 2},
+            ]
+        })
+        assert decision == 'reject'
+        assert counts[THUMBS_DOWN] == 2
+
+    def test_sync_reactions_marks_approved_and_posts_to_librarr(self):
+        from books_recommender.discord_workflow import sync_reactions, THUMBS_UP
+        from books_recommender.db import upsert_discord_message
+        import argparse
+
+        conn = self._make_db()
+        conn.execute(
+            '''INSERT INTO candidates (
+                id, source, source_uid, title, author, url, cover_url, media_type,
+                published_at, description, raw_json, score, score_breakdown,
+                status, created_at, updated_at
+            ) VALUES (1, 'openlibrary-trending', 'ol:/works/OL1W', 'Sample Book', 'Sample Author',
+                      'https://openlibrary.org/works/OL1W', '', 'audiobook',
+                      '2026-01-01T00:00:00Z', '', '{}', 88, '{}', 'discord_pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'''
+        )
+        upsert_discord_message(
+            conn,
+            candidate_id=1,
+            channel_id='123',
+            message_id='456',
+            content='**Sample Book** — Sample Author',
+            status='posted',
+        )
+
+        fake_cfg = {
+            'discord': {'enabled': True},
+            'librarr': {'url': 'http://librarr:5050', 'wishlist_media_type': 'audiobook'},
+        }
+
+        with patch('books_recommender.discord_workflow.resolve_discord_token', return_value='token'):
+            with patch('books_recommender.discord_workflow.discord_fetch_message', return_value={
+                'reactions': [
+                    {'emoji': {'name': THUMBS_UP}, 'count': 2},
+                    {'emoji': {'name': '👎'}, 'count': 1},
+                ]
+            }):
+                with patch('books_recommender.discord_workflow.LibrarrClient') as client_mock:
+                    client_mock.return_value.add_to_wishlist.return_value = {'id': 99}
+                    with patch('books_recommender.discord_workflow.discord_edit_message'):
+                        result = sync_reactions(conn, fake_cfg)
+
+        assert result['count'] == 1
+        row = conn.execute('SELECT status, librarr_id FROM candidates WHERE id=1').fetchone()
+        assert row['status'] == 'approved'
+        assert row['librarr_id'] == '99'
+        dm = conn.execute('SELECT status, reaction, librarr_id FROM discord_messages WHERE candidate_id=1').fetchone()
+        assert dm['status'] == 'approved'
+        assert dm['reaction'] == THUMBS_UP
+        assert dm['librarr_id'] == '99'
+
+    def test_post_recommendations_marks_pending_and_posts(self):
+        from books_recommender.discord_workflow import post_recommendations
+
+        conn = self._make_db()
+        conn.execute(
+            '''INSERT INTO candidates (
+                id, source, source_uid, title, author, url, cover_url, media_type,
+                published_at, description, raw_json, score, score_breakdown,
+                status, created_at, updated_at
+            ) VALUES (1, 'openlibrary-trending', 'ol:/works/OL1W', 'Sample Book', 'Sample Author',
+                      'https://openlibrary.org/works/OL1W', '', 'audiobook',
+                      '2026-01-01T00:00:00Z', '', '{}', NULL, NULL, 'new', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'''
+        )
+        conn.commit()
+
+        candidate = {
+            'id': 1,
+            'source': 'openlibrary-trending',
+            'source_uid': 'ol:/works/OL1W',
+            'title': 'Sample Book',
+            'author': 'Sample Author',
+            'url': 'https://openlibrary.org/works/OL1W',
+            'cover_url': '',
+            'media_type': 'audiobook',
+            'published_at': '2026-01-01T00:00:00Z',
+            'description': '',
+            'raw': {},
+            'score': 88,
+            'score_breakdown': {},
+            'status': 'new',
+        }
+        scored = {'score': 88, 'reasons': ['Fits the profile'], 'similar_books': []}
+        fake_cfg = {
+            'discord': {'enabled': True, 'channel_id': '#books'},
+            'librarr': {'url': 'http://librarr:5050', 'wishlist_media_type': 'audiobook'},
+        }
+
+        with patch('books_recommender.discord_workflow.resolve_discord_token', return_value='token'):
+            with patch('books_recommender.discord_workflow._resolve_discord_channel_id', return_value='123'):
+                with patch('books_recommender.discord_workflow._build_digest_candidates', return_value=([(candidate, scored)], None, 1)):
+                    with patch('books_recommender.discord_workflow.discord_post_message', return_value={'id': '456'}):
+                        with patch('books_recommender.discord_workflow.discord_add_reaction'):
+                            result = post_recommendations(conn, fake_cfg, limit=1)
+
+        assert result['posted'][0]['message_id'] == '456'
+        row = conn.execute('SELECT status FROM candidates WHERE id=1').fetchone()
+        assert row['status'] == 'discord_pending'
+        dm = conn.execute('SELECT status, message_id FROM discord_messages WHERE candidate_id=1').fetchone()
+        assert dm['status'] == 'posted'
+        assert dm['message_id'] == '456'

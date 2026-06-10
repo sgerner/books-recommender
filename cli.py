@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import load_config, resolve_librarr_api_key
 from .db import connect, get_books, get_candidates, get_embeddings_map, get_book_title_author_keys, init_db, record_feedback, set_candidate_status, upsert_candidate, upsert_source, dedupe_books_by_title_author, get_source, normalize_book_key, normalize_candidate_match_key
+from .discord_workflow import cmd_discord_post, cmd_discord_sync_reactions
 from .embeddings import EmbeddingItem, candidate_text, sync_embeddings, text_hash as embedding_text_hash, blob_to_vector
 from .enrichment import enrich_book_metadata
 from .goodreads import sync_goodreads_rss
@@ -840,6 +841,15 @@ def build_parser():
     s.add_argument('--format', choices=['markdown', 'json'], default='markdown')
     s.add_argument('--min-candidates', type=int, default=3, help='Alert if fewer than this many candidates scored')
     s.set_defaults(func=cmd_digest)
+
+    s = sub.add_parser('discord-post')
+    s.add_argument('--limit', type=int, default=10)
+    s.add_argument('--channel-id', default=None)
+    s.set_defaults(func=cmd_discord_post)
+
+    s = sub.add_parser('discord-sync-reactions')
+    s.add_argument('--channel-id', default=None)
+    s.set_defaults(func=cmd_discord_sync_reactions)
 
     s = sub.add_parser('approve')
     s.add_argument('candidate_id', type=int)

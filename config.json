@@ -7,8 +7,8 @@
     "wishlist_media_type": "audiobook"
   },
   "discord": {
-    "enabled": false,
-    "channel_id": null,
+    "enabled": true,
+    "channel_id": "#books",
     "post_hour_utc": 15,
     "post_weekday": 1
   },

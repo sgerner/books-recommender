@@ -102,6 +102,22 @@ CREATE TABLE IF NOT EXISTS embeddings (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(entity_type, entity_id, model)
 );
+CREATE TABLE IF NOT EXISTS discord_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'posted',
+    reaction TEXT,
+    reaction_counts_json TEXT,
+    librarr_id TEXT,
+    posted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    reacted_at TEXT,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(candidate_id),
+    UNIQUE(message_id)
+);
 """
 
 
@@ -361,6 +377,84 @@ def upsert_source(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
             row.get('last_seen_at'),
             row.get('last_hash'),
         ),
+    )
+    conn.commit()
+
+
+def upsert_discord_message(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: int,
+    channel_id: str,
+    message_id: str,
+    content: str,
+    status: str = 'posted',
+    reaction: str | None = None,
+    reaction_counts_json: str | None = None,
+    librarr_id: str | None = None,
+    reacted_at: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO discord_messages (
+            candidate_id, channel_id, message_id, content, status, reaction,
+            reaction_counts_json, librarr_id, reacted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(candidate_id) DO UPDATE SET
+          channel_id=excluded.channel_id,
+          message_id=excluded.message_id,
+          content=excluded.content,
+          status=excluded.status,
+          reaction=COALESCE(excluded.reaction, discord_messages.reaction),
+          reaction_counts_json=COALESCE(excluded.reaction_counts_json, discord_messages.reaction_counts_json),
+          librarr_id=COALESCE(excluded.librarr_id, discord_messages.librarr_id),
+          reacted_at=COALESCE(excluded.reacted_at, discord_messages.reacted_at),
+          updated_at=CURRENT_TIMESTAMP
+        """,
+        (candidate_id, channel_id, message_id, content, status, reaction, reaction_counts_json, librarr_id, reacted_at),
+    )
+    conn.commit()
+
+
+def get_discord_message_for_candidate(conn: sqlite3.Connection, candidate_id: int):
+    return conn.execute('SELECT * FROM discord_messages WHERE candidate_id=?', (candidate_id,)).fetchone()
+
+
+def get_discord_message_by_message_id(conn: sqlite3.Connection, message_id: str):
+    return conn.execute('SELECT * FROM discord_messages WHERE message_id=?', (message_id,)).fetchone()
+
+
+def get_pending_discord_messages(conn: sqlite3.Connection):
+    return list(
+        conn.execute(
+            """
+            SELECT dm.*, c.title, c.author, c.url, c.cover_url, c.media_type, c.published_at, c.description, c.raw_json, c.score, c.score_breakdown, c.status AS candidate_status
+            FROM discord_messages dm
+            JOIN candidates c ON c.id = dm.candidate_id
+            WHERE dm.status = 'posted' AND c.status = 'discord_pending'
+            ORDER BY dm.posted_at ASC
+            """
+        )
+    )
+
+
+def update_discord_message_status(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: int,
+    status: str,
+    reaction: str | None = None,
+    reaction_counts_json: str | None = None,
+    librarr_id: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE discord_messages
+        SET status=?, reaction=COALESCE(?, reaction), reaction_counts_json=COALESCE(?, reaction_counts_json),
+            librarr_id=COALESCE(?, librarr_id), reacted_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+        WHERE candidate_id=?
+        """,
+        (status, reaction, reaction_counts_json, librarr_id, candidate_id),
     )
     conn.commit()
 
