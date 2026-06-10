@@ -358,6 +358,50 @@ class TestCLIDigest:
         assert len(parsed) == 1
         assert parsed[0]['title'] == 'Test Book'
 
+    def test_enrich_candidates_accepts_sqlite_rows(self):
+        """Regression test: _enrich_candidates should work with sqlite3.Row inputs."""
+        from books_recommender.cli import _enrich_candidates
+
+        conn = self._make_db()
+        conn.execute(
+            '''INSERT INTO candidates (
+                source, source_uid, title, author, url, cover_url, media_type,
+                published_at, description, raw_json, score, score_breakdown,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)''',
+            (
+                'openlibrary-trending', 'ol:/works/OL1W', 'Sample Book', 'Sample Author',
+                'https://openlibrary.org/works/OL1W', '', 'audiobook',
+                '2026-01-01T00:00:00Z', '', json.dumps({'isbn': '9780000000000'}),
+                None, None, 'new',
+            ),
+        )
+        conn.commit()
+        row = conn.execute('SELECT * FROM candidates WHERE source_uid=?', ('ol:/works/OL1W',)).fetchone()
+
+        fake_meta = {
+            'provider': 'openlibrary-search',
+            'pages': 320,
+            'series': 'Example Series #1',
+            'genres': ['Fantasy'],
+            'isbn13': '9780000000000',
+            'language': 'English',
+            'first_published': 2026,
+            'cover_url': 'https://covers.openlibrary.org/b/id/12345-M.jpg',
+            'author': 'Sample Author',
+        }
+
+        with patch('books_recommender.cli.enrich_book_metadata', return_value=fake_meta):
+            stats = _enrich_candidates(conn, [row], {'enrichment': {'enabled': True, 'delay': 0, 'max_per_run': 5}})
+
+        assert stats['enriched'] == 1
+        updated = conn.execute('SELECT raw_json, cover_url FROM candidates WHERE source_uid=?', ('ol:/works/OL1W',)).fetchone()
+        raw = json.loads(updated['raw_json'])
+        assert raw['pages'] == 320
+        assert raw['genres'] == ['Fantasy']
+        assert raw['enrichment_provider'] == 'openlibrary-search'
+        assert updated['cover_url'] == 'https://covers.openlibrary.org/b/id/12345-M.jpg'
+
 
 # ---------------------------------------------------------------------------
 # Candidate is_banned tests

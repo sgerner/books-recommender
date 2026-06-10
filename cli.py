@@ -542,7 +542,8 @@ def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str,
     delay = enrich_cfg.get('delay', 2.0)
     max_enrichments = enrich_cfg.get('max_per_run', 15)
 
-    for candidate in candidates[:max_enrichments]:
+    for row in candidates[:max_enrichments]:
+        candidate = row if isinstance(row, dict) else _candidate_dict(row)
         raw = candidate.get('raw') or {}
         if not isinstance(raw, dict):
             raw = {}
