@@ -363,7 +363,8 @@ def cmd_discord_post(args) -> None:
     conn = connect(cfg["db_path"])
     init_db(conn)
     result = post_recommendations(conn, cfg, limit=args.limit, channel_id=args.channel_id)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if result.get("alert"):
+        print(result["alert"])
 
 
 def cmd_discord_sync_reactions(args) -> None:
