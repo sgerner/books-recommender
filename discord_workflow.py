@@ -184,9 +184,9 @@ def _build_digest_candidates(conn, cfg: dict[str, Any], limit: int) -> tuple[lis
     ]
     filtered.sort(key=lambda x: x[1].get("score", 0), reverse=True)
     rows = filtered[:limit]
-    min_candidates = int(cfg.get("recommendation", {}).get("min_candidates", 3))
+    min_candidates = int(cfg.get("recommendation", {}).get("min_candidates", 0))
     alert = None
-    if len(filtered) < min_candidates:
+    if min_candidates > 0 and len(filtered) < min_candidates:
         alert = f"WARNING: Only {len(filtered)} candidates scored (threshold: {min_candidates}). Pipeline may need attention."
     return rows, alert, len(filtered)
 

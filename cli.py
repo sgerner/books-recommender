@@ -695,18 +695,6 @@ def cmd_digest(args):
     changed = [(c, s) for c, s in changed if normalize_candidate_match_key(c.get('title', ''), c.get('author', '')) not in book_keys]
     rows = sorted(changed, key=lambda x: x[1]['score'], reverse=True)[: args.limit]
 
-    # Sanity check: alert if too few candidates scored.
-    total_active = len(changed)
-    if total_active < args.min_candidates:
-        alert = f'WARNING: Only {total_active} candidates scored (threshold: {args.min_candidates}). Pipeline may need attention.'
-        if args.format == 'json':
-            print(json.dumps({'alert': alert, 'total_scored': total_active, 'min_required': args.min_candidates, 'top': []}))
-        else:
-            print(f'# Weekly Book Recommendations')
-            print()
-            print(f'> {alert}')
-        return
-
     if args.format == 'json':
         print(json.dumps([{
             'id': c['id'], 'title': c['title'], 'author': c['author'], 'score': s['score'], 'reasons': s['reasons'], 'status': c['status'],
@@ -839,7 +827,6 @@ def build_parser():
     s = sub.add_parser('digest')
     s.add_argument('--limit', type=int, default=10)
     s.add_argument('--format', choices=['markdown', 'json'], default='markdown')
-    s.add_argument('--min-candidates', type=int, default=3, help='Alert if fewer than this many candidates scored')
     s.set_defaults(func=cmd_digest)
 
     s = sub.add_parser('discord-post')

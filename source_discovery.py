@@ -114,12 +114,27 @@ def _inject_query_param(url: str, key: str, value: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+_NON_BOOK_PATH_PATTERNS = (
+    'author/show/',
+    'author/list/',
+    'author/',
+    '/authors/',
+    '/a/',
+    '/contributor/',
+    '/writer/',
+    '/profile/',
+    '/user/show/',
+)
+
 def _bookish_link(href: str) -> bool:
     if not href:
         return False
     parsed = urlparse(href)
     host = parsed.netloc.lower()
     path = parsed.path.lower()
+    # Reject author/profile/contributor pages which link to people, not books.
+    if any(p in path for p in _NON_BOOK_PATH_PATTERNS):
+        return False
     return any(domain in host for domain in KNOWN_BOOK_DOMAINS) or bool(_BOOKISH_PATH_RE.search(path))
 
 
@@ -215,20 +230,46 @@ def _candidate_from_anchor(link: dict[str, str], page_text: str, html_blob: str,
 def _candidate_from_goodreads_match(match: re.Match[str], html_blob: str, source: dict[str, Any], index: int) -> dict[str, Any]:
     book_id = match.group(1)
     url = match.group(0)
-    snippet = html_blob[max(0, match.start() - 300): match.end() + 300]
+    snippet = html_blob[max(0, match.start() - 600): match.end() + 200]
     title = ''
     author = ''
-    title_match = re.search(r'alt=["\']([^"\']+)["\']', snippet, re.I)
+
+    # Try img alt attribute first (Goodreads genre page layout).
+    title_match = re.search(r'alt\s*=\s*["\x27]([^"\x27]{3,200})["\x27]', snippet, re.I)
     if title_match:
-        title = unescape(title_match.group(1)).strip()
+        raw_title = unescape(title_match.group(1)).strip()
+        raw_title = re.sub(r'\s+', ' ', raw_title)
+        if not raw_title.isdigit() and not re.search(r'[<>{}]|&amp;|&lt;|class\s*=|width\s*=|src\s*=', raw_title):
+            title = raw_title
+
+    # Fallback: heading or bookTitle span near the link.
+    if not title:
+        text_match = re.search(
+            r'(?:<h[1-6][^>]*>|<strong[^>]*>|<span\s+class\s*=\s*"[^"]*bookTitle[^"]*"[^>]*>|<span\s+class\s*=\s*"[^"]*title[^"]*"[^>]*>)\s*(.+?)\s*(?:</h[1-6]>|</strong>|</span>)',
+            snippet, re.I | re.S
+        )
+        if text_match:
+            title = unescape(html_to_text(text_match.group(1))).strip()
+            title = re.sub(r'\s+', ' ', title)
+
+    # Last resort: extract from URL slug.
     if not title:
         slug = url.split('/book/show/', 1)[-1].split('?', 1)[0]
         slug = slug.split('-', 1)[-1] if '-' in slug else slug
         title = unescape(slug.replace('-', ' ')).strip().title()
-    text = html_to_text(snippet)
-    author_match = _AUTHOR_RE.search(text)
+
+    # Reject if title is just a number or HTML garbage.
+    if title.isdigit() or not title or re.search(r'[<>{}]|&amp;|&lt;|class=|width=|src=|bookCover', title):
+        return None
+
+    # Author extraction with artifact filtering.
+    snippet_text = html_to_text(snippet)
+    author_match = _AUTHOR_RE.search(snippet_text)
     if author_match:
-        author = author_match.group(1).strip()
+        candidate_author = author_match.group(1).strip()
+        if not re.search(r'[<>{}"\x27]|width|height|class=|src=|bookCover|\.jpg|\.png|charset', candidate_author) and len(candidate_author.split()) <= 5:
+            author = candidate_author
+
     return _normalize_candidate(
         {
             'title': title,
@@ -314,7 +355,9 @@ def _candidates_from_anchor_scan(page: _PageParser, page_text: str, html_blob: s
             out.append(cand)
     # Goodreads links from raw html are especially useful on article roundup pages.
     for idx, match in enumerate(_GOODREADS_BOOK_RE.finditer(html_blob), 1):
-        out.append(_candidate_from_goodreads_match(match, html_blob, source, idx))
+        cand = _candidate_from_goodreads_match(match, html_blob, source, idx)
+        if cand:
+            out.append(cand)
     # De-duplicate by url+title.
     seen = set()
     deduped: list[dict[str, Any]] = []
