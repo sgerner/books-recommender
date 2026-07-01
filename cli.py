@@ -594,9 +594,10 @@ def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str,
 
         if enriched_data:
             raw.update(enriched_data)
+            resolved_author = meta.get('author') if not candidate.get('author') else None
             conn.execute(
-                'UPDATE candidates SET raw_json=?, cover_url=coalesce(?, cover_url) WHERE id=?',
-                (json.dumps(raw, ensure_ascii=False), meta.get('cover_url'), candidate['id']),
+                'UPDATE candidates SET raw_json=?, cover_url=coalesce(?, cover_url), author=coalesce(?, author) WHERE id=?',
+                (json.dumps(raw, ensure_ascii=False), meta.get('cover_url'), resolved_author, candidate['id']),
             )
             enriched += 1
 

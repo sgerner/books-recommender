@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -170,6 +171,26 @@ def _format_recommendation(candidate: dict[str, Any], scored: dict[str, Any]) ->
     return "\n".join(lines)
 
 
+def _candidate_quality_problem(candidate: dict[str, Any]) -> str | None:
+    title = str(candidate.get("title") or "").strip()
+    author = str(candidate.get("author") or "").strip()
+    url = str(candidate.get("url") or "")
+    lowered = title.lower().strip(" .…")
+    if not title:
+        return "missing title"
+    if not author:
+        return "missing author"
+    if lowered in {"saving", "loading", "read more", "learn more", "see all", "view all"}:
+        return "placeholder title"
+    if re.match(r"^(?:see all of this year|readers[’'] favorite|best books|new books recommended by readers|meet the winners|nominees here)", title, re.I):
+        return "navigation/category title"
+    if "/author/" in url or "/authors/" in url:
+        return "author/profile URL"
+    if title.casefold() == author.casefold():
+        return "title equals author"
+    return None
+
+
 def _build_digest_candidates(conn, cfg: dict[str, Any], limit: int) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], str | None, int]:
     # Weekly digest mode: enrich missing metadata, score pending items, and
     # filter out anything that already matches an existing book.
@@ -180,7 +201,8 @@ def _build_digest_candidates(conn, cfg: dict[str, Any], limit: int) -> tuple[lis
     filtered = [
         (candidate, scored)
         for candidate, scored in changed
-        if not (candidate_match_keys(candidate.get("title", ""), candidate.get("author", ""), candidate.get("source", "")) & book_keys)
+        if not _candidate_quality_problem(candidate)
+        and not (candidate_match_keys(candidate.get("title", ""), candidate.get("author", ""), candidate.get("source", "")) & book_keys)
     ]
     filtered.sort(key=lambda x: x[1].get("score", 0), reverse=True)
     rows = filtered[:limit]

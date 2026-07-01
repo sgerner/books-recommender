@@ -17,6 +17,8 @@ _AMP_RE = re.compile(r'&amp;')
 _BOOKISH_PATH_RE = re.compile(r'/(book|books|title|titles|novel|novels|story|stories|series|read|reads|dp|gp/product)/', re.I)
 _GOODREADS_BOOK_RE = re.compile(r'goodreads\.com/book/show/(\d+)', re.I)
 _AUTHOR_RE = re.compile(r'\bby\s+([^|\n\r<]{2,80})', re.I)
+_PLACEHOLDER_TITLE_RE = re.compile(r'^(?:saving|loading|more|here|read more|learn more|see all|view all)\s*[.…\.]*$', re.I)
+_NON_BOOK_TITLE_RE = re.compile(r'^(?:see all of this year|readers[’\'] favorite|best books|new books recommended by readers|meet the winners|nominees here)', re.I)
 
 KNOWN_BOOK_DOMAINS = (
     'goodreads.com',
@@ -135,6 +137,11 @@ def _bookish_link(href: str) -> bool:
     # Reject author/profile/contributor pages which link to people, not books.
     if any(p in path for p in _NON_BOOK_PATH_PATTERNS):
         return False
+    # Goodreads is noisy: blog, genre, choice-award and list pages are about
+    # books but are not themselves book candidates. Only /book/show links are
+    # safe to treat as candidate books.
+    if 'goodreads.com' in host:
+        return '/book/show/' in path
     return any(domain in host for domain in KNOWN_BOOK_DOMAINS) or bool(_BOOKISH_PATH_RE.search(path))
 
 
@@ -184,6 +191,8 @@ def _candidate_from_anchor(link: dict[str, str], page_text: str, html_blob: str,
         return None
     low_text = text.lower()
     if low_text.startswith(('writing in ', 'read in ', 'watch in ', 'listen to ', 'review round-up')):
+        return None
+    if _PLACEHOLDER_TITLE_RE.match(text) or _NON_BOOK_TITLE_RE.match(text):
         return None
     if not _bookish_link(href):
         return None
@@ -239,7 +248,10 @@ def _candidate_from_goodreads_match(match: re.Match[str], html_blob: str, source
     if title_match:
         raw_title = unescape(title_match.group(1)).strip()
         raw_title = re.sub(r'\s+', ' ', raw_title)
-        if not raw_title.isdigit() and not re.search(r'[<>{}]|&amp;|&lt;|class\s*=|width\s*=|src\s*=', raw_title):
+        if (not raw_title.isdigit()
+                and not _PLACEHOLDER_TITLE_RE.match(raw_title)
+                and not _NON_BOOK_TITLE_RE.match(raw_title)
+                and not re.search(r'[<>{}]|&amp;|&lt;|class\s*=|width\s*=|src\s*=', raw_title)):
             title = raw_title
 
     # Fallback: heading or bookTitle span near the link.
@@ -258,8 +270,12 @@ def _candidate_from_goodreads_match(match: re.Match[str], html_blob: str, source
         slug = slug.split('-', 1)[-1] if '-' in slug else slug
         title = unescape(slug.replace('-', ' ')).strip().title()
 
-    # Reject if title is just a number or HTML garbage.
-    if title.isdigit() or not title or re.search(r'[<>{}]|&amp;|&lt;|class=|width=|src=|bookCover', title):
+    # Reject if title is just a number, placeholder text, category/navigation
+    # copy, or HTML garbage.
+    if (title.isdigit() or not title
+            or _PLACEHOLDER_TITLE_RE.match(title)
+            or _NON_BOOK_TITLE_RE.match(title)
+            or re.search(r'[<>{}]|&amp;|&lt;|class=|width=|src=|bookCover', title)):
         return None
 
     # Author extraction with artifact filtering.
