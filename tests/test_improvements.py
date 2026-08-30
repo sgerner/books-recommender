@@ -613,3 +613,259 @@ class TestDiscordWorkflow:
         dm = conn.execute('SELECT status, message_id FROM discord_messages WHERE candidate_id=1').fetchone()
         assert dm['status'] == 'posted'
         assert dm['message_id'] == '456'
+
+
+class TestIngestionQualityRegressions:
+    def test_goodreads_structured_card_author_and_stable_uid(self):
+        from books_recommender.source_discovery import _candidate_from_anchor
+
+        source = {
+            'name': 'goodreads-science-fiction',
+            'url': 'https://www.goodreads.com/genres/science-fiction',
+            'media_type': 'audiobook',
+        }
+        href = '/book/show/12345-the-book'
+        html = f'''<div class="bookBox">
+          <a href="{href}"><img alt="The Book" /></a>
+          <div id="bookAuthors"><a class="authorName"><span itemprop="name">E.L. Wilk</span></a></div>
+        </div>'''
+
+        result = _candidate_from_anchor({'href': href, 'text': 'The Book'}, '', html, source, 1)
+
+        assert result is not None
+        assert result['title'] == 'The Book'
+        assert result['author'] == 'E.L. Wilk'
+        assert result['url'] == 'https://www.goodreads.com/book/show/12345-the-book'
+        assert result['source_uid'] == 'goodreads:12345'
+
+    def test_goodreads_embedded_html_card_author(self):
+        import re
+        from books_recommender.source_discovery import _GOODREADS_BOOK_RE, _candidate_from_goodreads_match
+
+        source = {
+            'name': 'goodreads-science-fiction',
+            'url': 'https://www.goodreads.com/genres/science-fiction',
+            'media_type': 'audiobook',
+        }
+        html = r'''goodreads.com/book/show/12345-the-book?from_choice=false\">The Book<\\/a><\\/h2>\\n<div>\\n by <a class=\\"authorName\\" href=\\"/author/show/1.Jane_Doe\\">Jane Doe<\\/a>\\n<\\/div>'''
+        html = html.replace(chr(92) * 2, chr(92)).replace(chr(92) * 2, chr(92))
+        match = re.search(_GOODREADS_BOOK_RE, html)
+
+        result = _candidate_from_goodreads_match(match, html, source, 1)
+
+        assert result is not None
+        assert result['author'] == 'Jane Doe'
+        assert result['source_uid'] == 'goodreads:12345'
+
+    def test_goodreads_navigation_link_is_rejected_after_resolution(self):
+        from books_recommender.source_discovery import _candidate_from_anchor
+
+        source = {
+            'name': 'goodreads-science-fiction',
+            'url': 'https://www.goodreads.com/genres/science-fiction',
+            'media_type': 'audiobook',
+        }
+        result = _candidate_from_anchor(
+            {'href': '/book/popular_by_date/2026/8', 'text': 'New Releases'},
+            '',
+            '<a href="/book/popular_by_date/2026/8">New Releases</a>',
+            source,
+            1,
+        )
+        assert result is None
+
+    def test_atom_nested_author_is_normalized(self):
+        from books_recommender.feeds import normalized_feed_items
+
+        xml = b'''<?xml version="1.0"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <title>Atom Book</title>
+            <id>tag:example,2026:1</id>
+            <link href="https://example.com/atom-book" />
+            <author><name>Jane Doe</name></author>
+            <summary>A book.</summary>
+            <updated>2026-08-29T00:00:00Z</updated>
+          </entry>
+        </feed>'''
+        with patch('books_recommender.feeds.fetch_url', return_value=(xml, 'application/atom+xml')):
+            items = normalized_feed_items('https://example.com/feed.atom')
+
+        assert items[0]['author'] == 'Jane Doe'
+        assert items[0]['title'] == 'Atom Book'
+
+    def test_openlibrary_title_lookup_requires_exact_title_and_prefers_author(self):
+        from books_recommender.enrichment import _fetch_openlibrary_title
+
+        payload = {
+            'docs': [
+                {'title': 'Violentia', 'author_name': ['Wrong Author'], 'language': ['eng'], 'edition_count': 99},
+                {'title': 'Violentiae', 'author_name': ['Adam Freeland'], 'language': ['eng'], 'edition_count': 1},
+            ]
+        }
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = json.dumps(payload).encode()
+        with patch('books_recommender.enrichment.urllib.request.urlopen', return_value=response):
+            result = _fetch_openlibrary_title('Violentiae', delay=0)
+
+        assert result is not None
+        assert result['author'] == 'Adam Freeland'
+
+    def test_openlibrary_exact_title_prefers_newer_exact_work(self):
+        from books_recommender.enrichment import _fetch_openlibrary_title
+
+        payload = {'docs': [
+            {'title': 'Not Till We Are Lost', 'author_name': ['William Wenthe'], 'language': ['eng'], 'first_publish_year': 2003},
+            {'title': 'Not Till We Are Lost', 'author_name': ['Dennis E. Taylor'], 'language': ['eng'], 'first_publish_year': 2024},
+        ]}
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = json.dumps(payload).encode()
+        with patch('books_recommender.enrichment.urllib.request.urlopen', return_value=response):
+            result = _fetch_openlibrary_title('Not Till We Are Lost (Bobiverse, #5)', delay=0)
+
+        assert result is not None
+        assert result['author'] == 'Dennis E. Taylor'
+
+    def test_partial_goodreads_result_walks_isbn_fallback_for_author(self):
+        from books_recommender.enrichment import enrich_book_metadata
+
+        goodreads_result = {
+            'pages': 371,
+            'genres': ['Fantasy'],
+            'isbn13': '9780593820261',
+        }
+        isbn_result = {
+            'pages': None,
+            'genres': [],
+            'author': 'Matt Dinniman',
+            'isbn13': '9780593820261',
+        }
+        with patch('books_recommender.enrichment._fetch_goodreads', return_value=goodreads_result):
+            with patch('books_recommender.enrichment._fetch_openlibrary_isbn', return_value=isbn_result) as isbn_mock:
+                with patch('books_recommender.enrichment._fetch_openlibrary_title') as title_mock:
+                    result = enrich_book_metadata(
+                        title="Carl's Doomsday Scenario",
+                        goodreads_id='212393364',
+                        delay=0,
+                    )
+
+        assert result['author'] == 'Matt Dinniman'
+        assert result['author_provider'] == 'openlibrary-isbn'
+        assert result['provider'] == 'goodreads+openlibrary-isbn'
+        assert result['fallback_used'] is True
+        isbn_mock.assert_called_once_with('9780593820261', delay=0)
+        title_mock.assert_not_called()
+
+    def test_historical_repair_uses_goodreads_author_and_merges_duplicates(self):
+        from books_recommender.cli import _repair_historical_goodreads_candidates
+        from books_recommender.db import connect, init_db
+
+        conn = connect(':memory:')
+        init_db(conn)
+        for uid, title in (
+            ('anchor:1:book', 'A Good Book'),
+            ('goodreads:12345:8', 'A Good Book by Jane Doe'),
+        ):
+            conn.execute(
+                '''INSERT INTO candidates (source, source_uid, title, author, url, media_type, raw_json, status)
+                   VALUES (?, ?, ?, '', ?, 'audiobook', ?, 'excluded')''',
+                ('goodreads-science-fiction', uid, title,
+                 'https://www.goodreads.com/book/show/12345-a-good-book', '{}'),
+            )
+        conn.commit()
+        cfg = {
+            'embeddings': {'enabled': False},
+            'recommendation': {'minimum_score': 0, 'banned_format_terms': []},
+            'source_weights': {},
+        }
+        metadata = {
+            'author': 'Jane Doe',
+            'author_provider': 'goodreads',
+            'provider': 'goodreads',
+            'providers': ['goodreads'],
+        }
+        with patch('books_recommender.cli.enrich_book_metadata', return_value=metadata):
+            stats = _repair_historical_goodreads_candidates(conn, cfg, delay=0)
+
+        row = conn.execute('SELECT title, author, source_uid, status FROM candidates').fetchone()
+        assert stats['repaired_rows'] == 2
+        assert stats['duplicate_rows_removed'] == 1
+        assert stats['reopened'] == 1
+        assert row['title'] == 'A Good Book'
+        assert row['author'] == 'Jane Doe'
+        assert row['source_uid'] == 'goodreads:12345'
+        assert row['status'] == 'new'
+
+    def test_upsert_candidate_does_not_erase_existing_author(self):
+        from books_recommender.db import connect, init_db, upsert_candidate
+
+        conn = connect(':memory:')
+        init_db(conn)
+        base = {
+            'source': 'test', 'source_uid': 'goodreads:1', 'title': 'Book',
+            'author': 'Known Author', 'url': '', 'raw': {}, 'status': 'new',
+        }
+        upsert_candidate(conn, base)
+        upsert_candidate(conn, {**base, 'author': ''})
+
+        row = conn.execute('SELECT author FROM candidates WHERE source_uid=?', ('goodreads:1',)).fetchone()
+        assert row['author'] == 'Known Author'
+
+    def test_field_aware_enrichment_repairs_author_with_existing_metadata(self):
+        from books_recommender.cli import _enrich_candidates
+
+        conn = TestCLIDigest()._make_db()
+        conn.execute(
+            '''INSERT INTO candidates (
+                source, source_uid, title, author, url, cover_url, media_type,
+                published_at, description, raw_json, score, score_breakdown,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)''',
+            (
+                'goodreads-science-fiction', 'goodreads:123', 'Known Title', '',
+                'https://www.goodreads.com/book/show/123-known-title', '', 'audiobook',
+                '2026-01-01T00:00:00Z', '', json.dumps({'pages': 320, 'genres': ['Fantasy'], 'isbn13': '9780000000000'}),
+                None, None, 'new',
+            ),
+        )
+        conn.commit()
+        row = conn.execute('SELECT * FROM candidates WHERE source_uid=?', ('goodreads:123',)).fetchone()
+        fake_meta = {
+            'provider': 'openlibrary-isbn',
+            'providers': ['openlibrary-isbn'],
+            'author': 'Recovered Author',
+            'author_provider': 'openlibrary-isbn',
+        }
+        with patch('books_recommender.cli.enrich_book_metadata', return_value=fake_meta) as enrich_mock:
+            stats = _enrich_candidates(conn, [row], {'enrichment': {'enabled': True, 'delay': 0, 'max_per_run': 5}})
+
+        assert stats['enriched'] == 1
+        assert stats['total_checked'] == 1
+        assert conn.execute('SELECT author FROM candidates WHERE source_uid=?', ('goodreads:123',)).fetchone()['author'] == 'Recovered Author'
+        enrich_mock.assert_called_once()
+
+    def test_discord_digest_records_quality_counts(self):
+        from books_recommender.discord_workflow import _build_digest_candidates
+
+        conn = TestCLIDigest()._make_db()
+        candidate = {
+            'id': 7, 'title': 'Unresolved Book', 'author': '', 'source': 'test',
+            'url': '', 'cover_url': '', 'media_type': 'audiobook', 'status': 'new',
+        }
+        scored = {'score': 80}
+        with patch('books_recommender.cli._score_pending', return_value=(None, [(candidate, scored)])):
+            with patch('books_recommender.cli._candidate_match_keys', return_value=set()):
+                rows, alert, total = _build_digest_candidates(conn, {'recommendation': {}}, 10)
+
+        event = conn.execute("SELECT kind, payload_json FROM events ORDER BY id DESC LIMIT 1").fetchone()
+        payload = json.loads(event['payload_json'])
+        assert rows == []
+        assert alert is None
+        assert total == 0
+        assert event['kind'] == 'discord_digest_quality'
+        assert payload['scored'] == 1
+        assert payload['quality_filtered'] == {'missing author': 1}

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_config, resolve_librarr_api_key
-from .db import connect, get_books, get_candidates, get_embeddings_map, get_book_title_author_keys, init_db, record_feedback, set_candidate_status, upsert_candidate, upsert_source, dedupe_books_by_title_author, get_source, normalize_book_key, normalize_candidate_match_key, candidate_match_keys
+from .db import connect, get_books, get_candidates, get_embeddings_map, get_book_title_author_keys, init_db, record_event, record_feedback, set_candidate_status, upsert_candidate, upsert_source, dedupe_books_by_title_author, get_source, normalize_book_key, normalize_candidate_match_key, candidate_match_keys
 from .discord_workflow import cmd_discord_post, cmd_discord_sync_reactions
 from .embeddings import EmbeddingItem, candidate_text, sync_embeddings, text_hash as embedding_text_hash, blob_to_vector
 from .enrichment import enrich_book_metadata
@@ -36,6 +37,50 @@ def _candidate_dict(row):
         'score_breakdown': json.loads(row['score_breakdown']) if row['score_breakdown'] else {},
         'status': row['status'],
     }
+
+
+def _candidate_dict(row):
+    raw = json.loads(row['raw_json']) if row['raw_json'] else {}
+    return {
+        'id': row['id'],
+        'source': row['source'],
+        'source_uid': row['source_uid'],
+        'title': row['title'],
+        'author': row['author'],
+        'url': row['url'],
+        'cover_url': row['cover_url'],
+        'media_type': row['media_type'] or 'audiobook',
+        'published_at': row['published_at'],
+        'description': row['description'] or '',
+        'raw': raw,
+        'score': row['score'],
+        'score_breakdown': json.loads(row['score_breakdown']) if row['score_breakdown'] else {},
+        'status': row['status'],
+    }
+
+
+def _goodreads_id_for_candidate(row: dict[str, Any]) -> str:
+    raw = row.get('raw') or {}
+    if isinstance(raw, dict) and raw.get('goodreads_id'):
+        match = re.search(r'\d+', str(raw['goodreads_id']))
+        if match:
+            return match.group(0)
+    for value in (row.get('url'), row.get('source_uid')):
+        match = re.search(r'goodreads(?:\.com)?[/:]?(?:book/show/)?(\d+)', str(value or ''), re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r'goodreads\.com/book/show/(\d+)', str(value or ''), re.I)
+        if match:
+            return match.group(1)
+    return ''
+
+
+def _strip_resolved_author_from_title(title: str, author: str) -> str:
+    title = re.sub(r'\s+', ' ', str(title or '')).strip()
+    author = re.sub(r'\s+', ' ', str(author or '')).strip()
+    if not title or not author:
+        return title
+    return re.sub(r'\s+by\s+' + re.escape(author) + r'\s*$', '', title, flags=re.I).strip(' \t-–—:') or title
 
 
 def cmd_init(args):
@@ -331,18 +376,21 @@ def _scan_one_source(conn, source, cfg):
         return {'source': source['name'], 'skipped': True, 'inserted': 0, 'reason': result.reason}
 
     existing_keys = _candidate_match_keys(conn)
-    existing_keys.update(
-        normalize_candidate_match_key(str(row['title']), str(row['author'] or ''))
-        for row in conn.execute('SELECT title, author FROM candidates').fetchall()
-    )
+    for row in conn.execute('SELECT title, author, source FROM candidates').fetchall():
+        existing_keys.update(candidate_match_keys(str(row['title']), str(row['author'] or ''), str(row['source'] or '')))
 
     inserted = 0
     skipped_dupe = 0
     for item in result.items:
         uid = item.get('source_uid') or item.get('guid') or item.get('url') or f"{source['name']}:{item.get('title', '')}"
+        # Normalize Goodreads IDs even if a caller supplied an older indexed UID.
+        if str(uid).startswith('goodreads:'):
+            uid = str(uid).split(':', 2)[0] + ':' + str(uid).split(':', 2)[1]
         raw = item.get('raw') or {}
         if item.get('source_meta'):
             raw = {**raw, 'source_meta': item.get('source_meta')}
+        if item.get('author'):
+            raw.setdefault('author_provider', 'source')
         row = {
             'source': source['name'],
             'source_uid': uid,
@@ -356,13 +404,32 @@ def _scan_one_source(conn, source, cfg):
             'raw': raw,
             'status': 'new',
         }
+        # Migrate the old ``goodreads:<id>:<page-index>`` key when a stable
+        # Goodreads key is first seen again. This prevents a repaired row from
+        # being inserted beside its historical blank-author duplicate.
+        if str(uid).startswith('goodreads:'):
+            stable_exists = conn.execute(
+                'SELECT 1 FROM candidates WHERE source=? AND source_uid=?',
+                (source['name'], uid),
+            ).fetchone()
+            if not stable_exists:
+                legacy = conn.execute(
+                    'SELECT source_uid FROM candidates WHERE source=? AND source_uid LIKE ? ORDER BY id LIMIT 1',
+                    (source['name'], f'{uid}:%'),
+                ).fetchone()
+                if legacy:
+                    conn.execute(
+                        'UPDATE candidates SET source_uid=? WHERE source=? AND source_uid=?',
+                        (uid, source['name'], legacy['source_uid']),
+                    )
+                    conn.commit()
         if candidate_is_banned(row, cfg.get('recommendation', {})):
             row['status'] = 'excluded'
             row['score'] = 0
             row['score_breakdown'] = {'score': 0, 'reasons': ['blocked format: graphic novel']}
             row['decided_at'] = datetime.now(timezone.utc).isoformat()
-        key = normalize_book_key(row['title'], row['author'])
-        if key in existing_keys:
+        keys = candidate_match_keys(row['title'], row['author'], row['source'])
+        if keys & existing_keys:
             skipped_dupe += 1
             continue
         existing = conn.execute('SELECT title, author, url, cover_url, media_type, published_at, description, raw_json FROM candidates WHERE source=? AND source_uid=?', (source['name'], uid)).fetchone()
@@ -377,7 +444,7 @@ def _scan_one_source(conn, source, cfg):
             if existing_fp == fingerprint:
                 continue
         upsert_candidate(conn, row)
-        existing_keys.add(key)
+        existing_keys.update(keys)
         inserted += 1
     if source.get('origin') and source.get('kind') not in {'rss', 'atom', 'goodreads-rss'}:
         archive_sources_in_inbox(source['origin'], [source['url']])
@@ -531,8 +598,8 @@ def _active_candidate_rows(conn):
 def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str, int]:
     """Enrich candidates with missing metadata via Goodreads/OpenLibrary fallback.
 
-    Only enriches candidates that are missing pages, genres, or series.
-    Rate-limited to avoid hitting API limits.
+    Enrichment is field-aware: a row with pages/genres but no author still
+    needs repair. Only eligible rows count against the per-run rate limit.
     """
     enrich_cfg = cfg.get('enrichment', {})
     if not enrich_cfg.get('enabled', True):
@@ -541,20 +608,28 @@ def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str,
     enriched = 0
     failed = 0
     delay = enrich_cfg.get('delay', 2.0)
-    max_enrichments = enrich_cfg.get('max_per_run', 15)
-
-    for row in candidates[:max_enrichments]:
+    max_enrichments = int(enrich_cfg.get('max_per_run', 15))
+    eligible: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
+    for row in candidates:
         candidate = row if isinstance(row, dict) else _candidate_dict(row)
         raw = candidate.get('raw') or {}
         if not isinstance(raw, dict):
             raw = {}
+        has_metadata = bool(raw.get('pages') or raw.get('genres') or raw.get('series'))
+        missing_author = not str(candidate.get('author') or '').strip()
+        if missing_author or not has_metadata:
+            eligible.append((row, candidate, raw))
+            if len(eligible) >= max_enrichments:
+                break
 
-        # Skip if already enriched (has pages or genres in raw metadata).
-        if raw.get('pages') or raw.get('genres'):
-            continue
-
+    for row, candidate, raw in eligible:
         goodreads_id = raw.get('goodreads_id')
-        isbn = raw.get('isbn') or candidate.get('isbn13')
+        if not goodreads_id:
+            url_match = re.search(r'goodreads\.com/book/show/(\d+)', str(candidate.get('url') or ''), re.I)
+            goodreads_id = url_match.group(1) if url_match else None
+            if goodreads_id:
+                raw['goodreads_id'] = goodreads_id
+        isbn = raw.get('isbn') or raw.get('isbn13') or candidate.get('isbn13')
 
         try:
             meta = enrich_book_metadata(
@@ -572,8 +647,7 @@ def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str,
             failed += 1
             continue
 
-        # Merge enriched metadata into candidate's raw dict.
-        enriched_data = {}
+        enriched_data: dict[str, Any] = {}
         if meta.get('pages'):
             enriched_data['pages'] = meta['pages']
         if meta.get('series'):
@@ -588,23 +662,288 @@ def _enrich_candidates(conn, candidates: list, cfg: dict[str, Any]) -> dict[str,
             enriched_data['first_published'] = meta['first_published']
         if meta.get('cover_url') and not candidate.get('cover_url'):
             enriched_data['cover_url'] = meta['cover_url']
-        if meta.get('author') and not candidate.get('author'):
-            enriched_data['resolved_author'] = meta['author']
-        enriched_data['enrichment_provider'] = meta.get('provider', 'unknown')
+
+        resolved_author = str(meta.get('author') or '').strip()
+        if resolved_author and not candidate.get('author') and resolved_author.casefold() != str(candidate.get('title') or '').strip().casefold():
+            enriched_data['resolved_author'] = resolved_author
+            enriched_data['author_provider'] = meta.get('author_provider') or meta.get('provider')
+        if meta.get('provider'):
+            enriched_data['enrichment_provider'] = meta['provider']
+        if meta.get('providers'):
+            enriched_data['enrichment_providers'] = meta['providers']
 
         if enriched_data:
             raw.update(enriched_data)
-            resolved_author = meta.get('author') if not candidate.get('author') else None
             conn.execute(
-                'UPDATE candidates SET raw_json=?, cover_url=coalesce(?, cover_url), author=coalesce(?, author) WHERE id=?',
-                (json.dumps(raw, ensure_ascii=False), meta.get('cover_url'), resolved_author, candidate['id']),
+                '''UPDATE candidates
+                   SET raw_json=?, cover_url=coalesce(?, cover_url),
+                       author=CASE WHEN trim(coalesce(?, '')) <> '' THEN ? ELSE author END,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?''',
+                (
+                    json.dumps(raw, ensure_ascii=False),
+                    meta.get('cover_url'),
+                    resolved_author if not candidate.get('author') else '',
+                    resolved_author if not candidate.get('author') else '',
+                    candidate['id'],
+                ),
             )
             enriched += 1
 
     if enriched:
         conn.commit()
 
-    return {'enriched': enriched, 'failed': failed, 'total_checked': len(candidates[:max_enrichments])}
+    return {'enriched': enriched, 'failed': failed, 'total_checked': len(eligible)}
+
+
+def _repair_historical_goodreads_candidates(
+    conn,
+    cfg: dict[str, Any],
+    *,
+    limit: int = 0,
+    delay: float = 0.2,
+    reopen: bool = True,
+) -> dict[str, Any]:
+    """Repair pre-fix Goodreads candidates without replaying source scans.
+
+    Only non-terminal rows with blank authors and an identifiable Goodreads book
+    ID are considered. Goodreads-by-ID is the authoritative repair source;
+    OpenLibrary suggestions are not silently promoted when Goodreads cannot
+    verify the author. Approval/rejection/Discord rows are never modified or
+    deleted.
+    """
+    terminal_statuses = {'approved', 'rejected', 'imported', 'discord_pending'}
+    rows = conn.execute(
+        "SELECT * FROM candidates WHERE trim(COALESCE(author, '')) = '' ORDER BY id"
+    ).fetchall()
+    groups: dict[tuple[str, str], list[Any]] = {}
+    skipped_no_id = 0
+    for row in rows:
+        if row['status'] in terminal_statuses:
+            continue
+        candidate = _candidate_dict(row)
+        goodreads_id = _goodreads_id_for_candidate(candidate)
+        if not goodreads_id:
+            skipped_no_id += 1
+            continue
+        groups.setdefault((str(row['source']), goodreads_id), []).append(row)
+
+    selected_groups = list(groups.items())
+    if limit > 0:
+        selected_groups = selected_groups[:limit]
+    stats: dict[str, Any] = {
+        'groups_considered': len(selected_groups),
+        'rows_considered': sum(len(group) for _, group in selected_groups),
+        'repaired_groups': 0,
+        'repaired_rows': 0,
+        'unresolved_groups': 0,
+        'fallback_only_groups': 0,
+        'errors': 0,
+        'skipped_without_goodreads_id': skipped_no_id,
+        'duplicate_rows_removed': 0,
+        'protected_duplicate_groups': 0,
+        'rescored': 0,
+        'reopened': 0,
+        'library_matches': 0,
+        'below_threshold': 0,
+    }
+    repaired_groups: list[tuple[str, str]] = []
+    repaired_ids: list[int] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for (source, goodreads_id), group in selected_groups:
+        representative = max(group, key=lambda row: (len(row['title'] or ''), -int(row['id'])))
+        candidate = _candidate_dict(representative)
+        try:
+            metadata = enrich_book_metadata(
+                title=candidate.get('title', ''),
+                author='',
+                goodreads_id=goodreads_id,
+                delay=delay,
+            )
+        except Exception:
+            stats['errors'] += 1
+            continue
+
+        resolved_author = str(metadata.get('author') or '').strip()
+        author_provider = str(metadata.get('author_provider') or '').strip()
+        if not resolved_author:
+            stats['unresolved_groups'] += 1
+            continue
+        if author_provider != 'goodreads':
+            # OpenLibrary is useful as an investigative fallback, but a title
+            # match alone is not strong enough to rewrite historical rows.
+            stats['fallback_only_groups'] += 1
+            continue
+
+        repaired_groups.append((source, goodreads_id))
+        for row in group:
+            raw = json.loads(row['raw_json']) if row['raw_json'] else {}
+            if not isinstance(raw, dict):
+                raw = {}
+            repair_info = raw.get('historical_repair')
+            if not isinstance(repair_info, dict):
+                repair_info = {
+                    'previous_status': row['status'],
+                    'previous_score': row['score'],
+                    'first_repaired_at': now,
+                }
+            raw['goodreads_id'] = goodreads_id
+            raw['resolved_author'] = resolved_author
+            raw['author_provider'] = 'goodreads'
+            raw['enrichment_provider'] = metadata.get('provider') or 'goodreads'
+            if metadata.get('providers'):
+                raw['enrichment_providers'] = metadata['providers']
+            for key in ('pages', 'series', 'genres', 'isbn13', 'language', 'format', 'first_published'):
+                value = metadata.get(key)
+                if value not in (None, '', []):
+                    raw[key] = value
+            repair_info.update({
+                'repaired_at': now,
+                'method': 'goodreads-book-id',
+                'goodreads_id': goodreads_id,
+                'author': resolved_author,
+                'author_provider': 'goodreads',
+            })
+            raw['historical_repair'] = repair_info
+            title = _strip_resolved_author_from_title(row['title'], resolved_author)
+            cover_url = metadata.get('cover_url') or row['cover_url']
+            conn.execute(
+                """UPDATE candidates
+                   SET title=?, author=?, raw_json=?, cover_url=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND status NOT IN ('approved','rejected','imported','discord_pending')""",
+                (
+                    title,
+                    resolved_author,
+                    json.dumps(raw, ensure_ascii=False),
+                    cover_url,
+                    row['id'],
+                ),
+            )
+            repaired_ids.append(int(row['id']))
+            stats['repaired_rows'] += 1
+        stats['repaired_groups'] += 1
+        if len(repaired_groups) % 25 == 0:
+            conn.commit()
+    conn.commit()
+
+    # Collapse the old anchor/index duplicates for only the Goodreads IDs just
+    # repaired. Do not run the broad candidate dedupe, which is allowed to
+    # remove unrelated historical rows.
+    for source, goodreads_id in repaired_groups:
+        source_rows = conn.execute('SELECT * FROM candidates WHERE source=?', (source,)).fetchall()
+        group = [
+            row for row in source_rows
+            if _goodreads_id_for_candidate(_candidate_dict(row)) == goodreads_id
+        ]
+        if len(group) <= 1:
+            if group and group[0]['source_uid'] != f'goodreads:{goodreads_id}':
+                conn.execute(
+                    'UPDATE candidates SET source_uid=? WHERE id=?',
+                    (f'goodreads:{goodreads_id}', group[0]['id']),
+                )
+            continue
+        protected = False
+        for row in group:
+            if row['status'] in terminal_statuses:
+                protected = True
+                break
+            if conn.execute('SELECT 1 FROM discord_messages WHERE candidate_id=? LIMIT 1', (row['id'],)).fetchone():
+                protected = True
+                break
+            if conn.execute('SELECT 1 FROM feedback WHERE candidate_id=? LIMIT 1', (row['id'],)).fetchone():
+                protected = True
+                break
+        if protected:
+            stats['protected_duplicate_groups'] += 1
+            continue
+        keep = max(
+            group,
+            key=lambda row: (
+                len(row['title'] or ''),
+                len(row['description'] or ''),
+                1 if str(row['url'] or '').startswith('http') else 0,
+                -int(row['id']),
+            ),
+        )
+        doomed = [row['id'] for row in group if row['id'] != keep['id']]
+        if doomed:
+            placeholders = ','.join('?' for _ in doomed)
+            conn.execute(f'DELETE FROM candidates WHERE id IN ({placeholders})', doomed)
+            stats['duplicate_rows_removed'] += len(doomed)
+        conn.execute(
+            'UPDATE candidates SET source_uid=? WHERE id=?',
+            (f'goodreads:{goodreads_id}', keep['id']),
+        )
+    conn.commit()
+
+    survivors = []
+    for candidate_id in repaired_ids:
+        row = conn.execute('SELECT * FROM candidates WHERE id=?', (candidate_id,)).fetchone()
+        if row and row['author'] and row['status'] not in terminal_statuses:
+            survivors.append(row)
+    if not survivors:
+        record_event(conn, 'historical_candidate_repair', stats)
+        return stats
+
+    # Re-score repaired rows directly. They remain excluded unless they clear
+    # the normal threshold, so a metadata repair cannot flood the next digest.
+    profile = build_profile(_book_rows(conn), conn=conn, embedding_cfg=cfg.get('embeddings', {}))
+    book_keys = _candidate_match_keys(conn)
+    threshold = int(cfg.get('recommendation', {}).get('minimum_score', 69))
+    source_weights = cfg.get('source_weights', {})
+    for row in survivors:
+        candidate = _candidate_dict(row)
+        weight = source_weights.get(candidate['source'], source_weights.get('rss', 0.0))
+        scored = score_candidate(
+            candidate,
+            profile,
+            source_weight=weight,
+            explain=True,
+            recommendation_cfg=cfg.get('recommendation', {}),
+        )
+        raw = candidate.get('raw') or {}
+        repair_info = raw.get('historical_repair') if isinstance(raw, dict) else {}
+        if isinstance(repair_info, dict):
+            repair_info['rescored_score'] = scored['score']
+            repair_info['rescored_at'] = now
+            raw['historical_repair'] = repair_info
+        library_match = bool(candidate_match_keys(candidate.get('title', ''), candidate.get('author', ''), candidate.get('source', '')) & book_keys)
+        conn.execute(
+            'UPDATE candidates SET score=?, score_breakdown=?, raw_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?',
+            (scored['score'], json.dumps(scored, ensure_ascii=False), json.dumps(raw, ensure_ascii=False), row['id']),
+        )
+        stats['rescored'] += 1
+        if library_match:
+            stats['library_matches'] += 1
+        elif int(scored.get('score', 0)) >= threshold and not candidate_is_banned(candidate, cfg.get('recommendation', {})):
+            if reopen and row['status'] == 'excluded':
+                repair_info['reopened_at'] = now
+                raw['historical_repair'] = repair_info
+                conn.execute(
+                    "UPDATE candidates SET status='new', decided_at=NULL, raw_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='excluded'",
+                    (json.dumps(raw, ensure_ascii=False), row['id']),
+                )
+                stats['reopened'] += 1
+        else:
+            stats['below_threshold'] += 1
+    conn.commit()
+    record_event(conn, 'historical_candidate_repair', stats)
+    return stats
+
+
+def cmd_repair_candidates(args):
+    cfg = load_config(args.config)
+    conn = connect(cfg['db_path'])
+    init_db(conn)
+    stats = _repair_historical_goodreads_candidates(
+        conn,
+        cfg,
+        limit=args.limit,
+        delay=args.delay,
+        reopen=not args.no_reopen,
+    )
+    print(json.dumps(stats, indent=2, ensure_ascii=False))
 
 
 def _retire_low_scoring_candidates(conn, changed, cfg) -> dict[str, int]:
@@ -631,11 +970,13 @@ def _score_pending(conn, cfg, *, sync_books: bool = True, explain: bool = False,
         _sync_book_embeddings(conn, cfg)
     _dedupe_candidates(conn)
 
-    # Enrich candidates missing metadata before scoring (digest mode).
+    # Enrichment can change the title/author identity, so de-duplicate again
+    # after repairing metadata before embeddings and scoring are prepared.
     if enrich:
         candidate_rows_for_enrich = _active_candidate_rows(conn)
         if candidate_rows_for_enrich:
             _enrich_candidates(conn, candidate_rows_for_enrich, cfg)
+        _dedupe_candidates(conn)
 
     profile = build_profile(_book_rows(conn), conn=conn, embedding_cfg=cfg.get('embeddings', {}))
     source_weights = cfg.get('source_weights', {})
@@ -704,6 +1045,9 @@ def cmd_digest(args):
         return
     print('# Weekly Book Recommendations')
     print()
+    if not rows:
+        print('WARNING: 0 candidates are eligible after metadata and library-quality filters.')
+        print()
     for c, s in rows:
         print(f"## {c['title']} — {c.get('author') or 'Unknown'}")
         print(f"Score: {s['score']}/100")
@@ -766,8 +1110,9 @@ def cmd_nightly(args):
     for source in combined_sources(cfg):
         scan.append(_scan_one_source(conn, source, cfg))
     candidate_dedupe = _dedupe_candidates(conn)
-    # Nightly should never resync all book embeddings, but it should embed/score active candidates.
-    profile, changed = _score_pending(conn, cfg, sync_books=not args.no_sync_embeddings, explain=False)
+    # Nightly should never resync all book embeddings, but it should repair
+    # missing candidate authors/metadata before embedding and scoring.
+    profile, changed = _score_pending(conn, cfg, sync_books=not args.no_sync_embeddings, explain=False, enrich=True)
     retired = _retire_low_scoring_candidates(conn, changed, cfg)
     # Filter out candidates whose title+author match an existing book.
     book_keys = _candidate_match_keys(conn)
@@ -829,6 +1174,12 @@ def build_parser():
     s.add_argument('--limit', type=int, default=10)
     s.add_argument('--format', choices=['markdown', 'json'], default='markdown')
     s.set_defaults(func=cmd_digest)
+
+    s = sub.add_parser('repair-candidates', help='Repair historical blank-author Goodreads candidates')
+    s.add_argument('--limit', type=int, default=0, help='Maximum Goodreads IDs to repair; 0 means all')
+    s.add_argument('--delay', type=float, default=0.2, help='Delay between metadata requests in seconds')
+    s.add_argument('--no-reopen', action='store_true', help='Repair and rescore, but leave excluded rows excluded')
+    s.set_defaults(func=cmd_repair_candidates)
 
     s = sub.add_parser('discord-post')
     s.add_argument('--limit', type=int, default=10)

@@ -54,7 +54,17 @@ def _local_name(tag: str) -> str:
 def _child_text(elem: ET.Element, name: str) -> str:
     for child in list(elem):
         if _local_name(child.tag) == name:
-            return (child.text or '').strip()
+            return ''.join(child.itertext()).strip()
+    return ''
+
+
+def _first_author_text(elem: ET.Element) -> str:
+    """Read common RSS/Atom author fields, including nested Atom ``name``."""
+    for child in list(elem):
+        if _local_name(child.tag) in {'author_name', 'creator', 'author'}:
+            value = ''.join(child.itertext()).strip()
+            if value:
+                return value
     return ''
 
 
@@ -97,7 +107,8 @@ def parse_item(item: ET.Element) -> dict[str, Any]:
         'summary_html': _child_text(item, 'description') or _child_text(item, 'encoded') or '',
         'published_at': parse_datetime(_child_text(item, 'pubdate') or _child_text(item, 'date')),
         'categories': categories,
-        'raw': {child.tag: child.text for child in list(item)},
+        'author': _first_author_text(item),
+        'raw': {child.tag: ''.join(child.itertext()).strip() for child in list(item)},
     }
 
 
@@ -113,7 +124,8 @@ def parse_atom_entry(entry: ET.Element) -> dict[str, Any]:
         'guid': _child_text(entry, 'id') or '',
         'summary_html': _child_text(entry, 'summary') or _child_text(entry, 'content') or '',
         'published_at': parse_datetime(_child_text(entry, 'updated') or _child_text(entry, 'published')),
-        'raw': {child.tag: child.text for child in list(entry)},
+        'author': _first_author_text(entry),
+        'raw': {child.tag: ''.join(child.itertext()).strip() for child in list(entry)},
     }
 
 
@@ -123,21 +135,36 @@ def extract_goodreads_book_refs(html_blob: str) -> list[dict[str, str]]:
     for match in BOOK_URL_RE.finditer(html_blob):
         book_id = match.group(1)
         url = match.group(0)
-        snippet = html_blob[max(0, match.start() - 300): match.end() + 300]
+        snippet = html_blob[max(0, match.start() - 900): match.end() + 1200]
         title = ''
         alt = ALT_RE.search(snippet)
         if alt:
             title = html.unescape(alt.group(1)).strip()
         if not title:
-            # Goodreads slugs usually look like title-with-hyphens; use last segment as fallback.
             slug = url.split('/book/show/', 1)[-1].split('?', 1)[0]
             slug = slug.split('-', 1)[-1] if '-' in slug else slug
             title = html.unescape(slug.replace('-', ' ')).strip().title()
+
         author = ''
-        plain = html_to_text(snippet)
-        am = AUTHOR_RE.search(plain)
-        if am:
-            author = am.group(1).strip()
+        inline = re.match(r'^(.+?)\s+by\s+(.+?)\s*$', title, re.I)
+        if inline:
+            possible_author = re.sub(r'\s+', ' ', html.unescape(inline.group(2))).strip(' ,:;')
+            if 1 <= len(possible_author.split()) <= 6 and not re.search(r'(?i)\b(?:the|and|with|for|from|author)\b', possible_author):
+                title = inline.group(1).strip(' -–—:')
+                author = possible_author
+        if not author:
+            structured = re.search(
+                r"""<(?:span|a)[^>]*(?:class=["'][^"']*\bauthorName\b[^"']*["']|itemprop=["']name["'])[^>]*>(.*?)</(?:span|a)>""",
+                snippet,
+                re.I | re.S,
+            )
+            if structured:
+                author = re.sub(r'\s+', ' ', html_to_text(structured.group(1))).strip()
+        if not author:
+            plain = html_to_text(snippet)
+            am = AUTHOR_RE.search(plain)
+            if am:
+                author = re.sub(r'\s+', ' ', am.group(1)).strip(' ,:;')
         refs.append({'goodreads_id': book_id, 'url': url, 'title': title, 'author': author})
     if not refs:
         plain = html_to_text(html_blob)
@@ -146,7 +173,7 @@ def extract_goodreads_book_refs(html_blob: str) -> list[dict[str, str]]:
     seen = set()
     out = []
     for ref in refs:
-        key = (ref.get('goodreads_id') or '', ref.get('title') or '')
+        key = ref.get('goodreads_id') or (ref.get('url') or ref.get('title') or '').lower()
         if key in seen:
             continue
         seen.add(key)
@@ -179,6 +206,10 @@ def _split_title_author(title: str) -> tuple[str, str]:
 def normalized_feed_items(url: str) -> list[dict[str, Any]]:
     items = parse_feed(url)
     out: list[dict[str, Any]] = []
+    non_author_categories = {
+        'audio-books', 'audiobooks', 'fiction', 'nonfiction', 'non-fiction',
+        'mysteries & thrillers', 'sci-fi & fantasy', 'biographies & memoirs',
+    }
     for item in items:
         desc = item.get('summary_html') or ''
         refs = extract_goodreads_book_refs(desc) if 'goodreads.com' in (item.get('link') or desc) else []
@@ -186,13 +217,21 @@ def normalized_feed_items(url: str) -> list[dict[str, Any]]:
             for ref in refs:
                 out.append({**item, **ref})
         else:
-            # Extract author from categories (first category is often the author)
-            author = ''
-            categories = item.get('categories') or []
-            if categories:
-                author = categories[0]
+            raw = item.get('raw') if isinstance(item.get('raw'), dict) else {}
+            author = item.get('author') or ''
+            if not author:
+                for key, value in raw.items():
+                    local = str(key).rsplit('}', 1)[-1].lower().replace(':', '_')
+                    if local in {'author_name', 'creator', 'dc_creator', 'itunes_author', 'author'} and value:
+                        author = str(value).strip()
+                        break
+            if ' name: ' in author:
+                author = author.split(' name: ', 1)[0].strip()
 
-            # If still no author, try splitting "Title - Author" from title
+            categories = item.get('categories') or []
+            if not author:
+                author = next((c for c in categories if c.strip().lower() not in non_author_categories), '')
+
             title = item.get('title', '')
             if not author and ' - ' in title:
                 split_title, split_author = _split_title_author(title)
@@ -200,9 +239,13 @@ def normalized_feed_items(url: str) -> list[dict[str, Any]]:
                     title = split_title
                     author = split_author
 
-            # Use summary_html as clean title if it exists and is shorter
-            clean_title = desc if desc and len(desc) < len(title) else title
-
+            clean_desc = html_to_text(desc).strip()
+            clean_title = (
+                clean_desc
+                if clean_desc and len(clean_desc) < len(title)
+                and (' - ' in title or clean_desc.casefold() in title.casefold())
+                else title
+            )
             out.append({
                 **item,
                 'title': clean_title,

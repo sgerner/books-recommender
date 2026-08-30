@@ -14,6 +14,7 @@ from .db import (
     connect,
     get_pending_discord_messages,
     init_db,
+    record_event,
     record_feedback,
     set_candidate_status,
     update_discord_message_status,
@@ -198,14 +199,32 @@ def _build_digest_candidates(conn, cfg: dict[str, Any], limit: int) -> tuple[lis
 
     _, changed = _score_pending(conn, cfg, sync_books=False, explain=True, enrich=True)
     book_keys = _candidate_match_keys(conn)
-    filtered = [
-        (candidate, scored)
-        for candidate, scored in changed
-        if not _candidate_quality_problem(candidate)
-        and not (candidate_match_keys(candidate.get("title", ""), candidate.get("author", ""), candidate.get("source", "")) & book_keys)
-    ]
+    quality_counts: dict[str, int] = {}
+    library_matches = 0
+    filtered: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for candidate, scored in changed:
+        problem = _candidate_quality_problem(candidate)
+        if problem:
+            quality_counts[problem] = quality_counts.get(problem, 0) + 1
+            continue
+        if candidate_match_keys(candidate.get("title", ""), candidate.get("author", ""), candidate.get("source", "")) & book_keys:
+            library_matches += 1
+            continue
+        filtered.append((candidate, scored))
+
     filtered.sort(key=lambda x: x[1].get("score", 0), reverse=True)
     rows = filtered[:limit]
+    record_event(
+        conn,
+        "discord_digest_quality",
+        {
+            "scored": len(changed),
+            "quality_filtered": quality_counts,
+            "library_matches": library_matches,
+            "eligible": len(filtered),
+            "selected": len(rows),
+        },
+    )
     min_candidates = int(cfg.get("recommendation", {}).get("min_candidates", 0))
     alert = None
     if min_candidates > 0 and len(filtered) < min_candidates:

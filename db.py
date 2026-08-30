@@ -235,7 +235,7 @@ def upsert_candidate(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'new'), ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(source, source_uid) DO UPDATE SET
           title=excluded.title,
-          author=excluded.author,
+          author=CASE WHEN trim(coalesce(excluded.author, '')) <> '' THEN excluded.author ELSE candidates.author END,
           url=excluded.url,
           cover_url=excluded.cover_url,
           media_type=excluded.media_type,
