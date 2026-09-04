@@ -869,3 +869,136 @@ class TestIngestionQualityRegressions:
         assert event['kind'] == 'discord_digest_quality'
         assert payload['scored'] == 1
         assert payload['quality_filtered'] == {'missing author': 1}
+
+    def test_namespaced_rss_is_parsed_with_one_network_fetch(self):
+        from books_recommender.source_discovery import discover_source_items
+
+        xml = b'''<?xml version="1.0"?>
+        <rss xmlns="http://backend.userland.com/rss2">
+          <channel><item>
+            <title>Feed Book</title><guid>book-1</guid>
+            <link>https://example.com/books/feed-book</link>
+            <description>A description.</description>
+          </item></channel>
+        </rss>'''
+        source = {'name': 'namespaced-feed', 'kind': 'rss', 'url': 'https://example.com/feed.xml', 'media_type': 'audiobook'}
+        with patch('books_recommender.source_discovery.fetch_url', return_value=(xml, 'application/rss+xml')) as fetch:
+            result = discover_source_items(source, {})
+
+        assert fetch.call_count == 1
+        assert result.skipped is False
+        assert len(result.items) == 1
+        assert result.items[0]['source_uid'] == 'book-1'
+
+    def test_atom_author_ignores_email_and_uri_descendants(self):
+        from books_recommender.feeds import normalized_feed_items
+
+        xml = b'''<?xml version="1.0"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <title>Atom Book</title><id>tag:example,2026:1</id>
+            <link href="https://example.com/atom-book" />
+            <author><name>Jane Doe</name><email>jane@example.com</email>
+              <uri>https://example.com/jane</uri></author>
+          </entry>
+        </feed>'''
+        with patch('books_recommender.feeds.fetch_url', return_value=(xml, 'application/atom+xml')):
+            items = normalized_feed_items('https://example.com/feed.atom')
+
+        assert items[0]['author'] == 'Jane Doe'
+
+    def test_goodreads_multi_book_feed_entry_gets_unique_book_uids(self):
+        from books_recommender.source_discovery import discover_source_items
+
+        xml = b'''<rss><channel><item>
+          <title>Steven's Goodreads update</title>
+          <guid>https://www.goodreads.com/review/show/42</guid>
+          <link>https://www.goodreads.com/review/show/42</link>
+          <description><![CDATA[
+            <a href="https://www.goodreads.com/book/show/111-first-book"><img alt="First Book" /></a>
+            <a href="https://www.goodreads.com/book/show/222-second-book"><img alt="Second Book" /></a>
+          ]]></description>
+        </item></channel></rss>'''
+        source = {'name': 'goodreads-rss', 'kind': 'rss', 'url': 'https://www.goodreads.com/reviews.rss', 'media_type': 'audiobook'}
+        with patch('books_recommender.source_discovery.fetch_url', return_value=(xml, 'application/rss+xml')):
+            result = discover_source_items(source, {})
+
+        assert [item['source_uid'] for item in result.items] == ['goodreads:111', 'goodreads:222']
+        assert [item['url'] for item in result.items] == [
+            'https://www.goodreads.com/book/show/111-first-book',
+            'https://www.goodreads.com/book/show/222-second-book',
+        ]
+
+    def test_goodreads_sync_uses_per_book_per_review_uid(self):
+        from books_recommender.goodreads import sync_goodreads_rss
+        from books_recommender.db import connect, init_db
+
+        conn = connect(':memory:')
+        init_db(conn)
+        items = [
+            {'goodreads_id': '111', 'guid': 'https://www.goodreads.com/review/show/42', 'title': 'First', 'author': 'A', 'url': 'https://www.goodreads.com/book/show/111-first', 'published_at': None, 'raw': {}},
+            {'goodreads_id': '222', 'guid': 'https://www.goodreads.com/review/show/42', 'title': 'Second', 'author': 'B', 'url': 'https://www.goodreads.com/book/show/222-second', 'published_at': None, 'raw': {}},
+        ]
+        with patch('books_recommender.goodreads.normalized_feed_items', return_value=items):
+            stats = sync_goodreads_rss(conn, 'https://example.com/reviews.rss')
+
+        assert stats['inserted'] == 2
+        uids = [row['source_uid'] for row in conn.execute('SELECT source_uid FROM read_events ORDER BY id')]
+        assert uids == ['goodreads:111:review:42', 'goodreads:222:review:42']
+
+    def test_jsonld_author_lists_are_preserved(self):
+        from books_recommender.source_discovery import _candidates_from_json_ld
+
+        source = {'name': 'jsonld', 'url': 'https://example.com/books', 'media_type': 'audiobook'}
+        items = _candidates_from_json_ld([{
+            '@type': 'Book',
+            'name': 'A Shared Book',
+            'author': [{'@type': 'Person', 'name': 'Jane Doe'}, {'@type': 'Person', 'name': 'John Doe'}],
+            'url': '/books/shared',
+        }], source)
+
+        assert items[0]['author'] == 'Jane Doe, John Doe'
+
+    def test_candidate_upsert_preserves_provenance_and_discord_pending_status(self):
+        from books_recommender.db import connect, init_db, upsert_candidate
+
+        conn = connect(':memory:')
+        init_db(conn)
+        base = {
+            'source': 'feed', 'source_uid': 'book-1', 'title': 'Book', 'author': 'Author',
+            'url': 'https://example.com/book', 'media_type': 'audiobook', 'status': 'discord_pending',
+            'raw': {'enrichment_provider': 'goodreads', 'pages': 320},
+        }
+        upsert_candidate(conn, base)
+        upsert_candidate(conn, {**base, 'status': 'new', 'raw': {'source_meta': {'strategy': 'feed'}}})
+
+        row = conn.execute('SELECT status, raw_json FROM candidates WHERE source_uid=?', ('book-1',)).fetchone()
+        raw = json.loads(row['raw_json'])
+        assert row['status'] == 'discord_pending'
+        assert raw['enrichment_provider'] == 'goodreads'
+        assert raw['source_meta'] == {'strategy': 'feed'}
+
+    def test_candidate_dedupe_preserves_referenced_rows_and_cleans_embeddings(self):
+        from books_recommender.cli import _dedupe_candidates
+        from books_recommender.db import connect, init_db, upsert_candidate, upsert_discord_message, upsert_embedding
+
+        conn = connect(':memory:')
+        init_db(conn)
+        protected_id = upsert_candidate(conn, {
+            'source': 'feed-a', 'source_uid': 'protected', 'title': 'Same Book', 'author': 'Author',
+            'url': 'https://example.com/protected', 'status': 'discord_pending', 'raw': {},
+        })
+        duplicate_id = upsert_candidate(conn, {
+            'source': 'feed-b', 'source_uid': 'duplicate', 'title': 'Same Book', 'author': 'Author',
+            'url': 'https://example.com/duplicate', 'status': 'new', 'raw': {},
+        })
+        upsert_discord_message(conn, candidate_id=protected_id, channel_id='books', message_id='message-1', content='book')
+        upsert_embedding(conn, entity_type='candidate', entity_id=duplicate_id, model='test', text_hash='hash', dim=1, vector_blob=b'1')
+
+        result = _dedupe_candidates(conn)
+
+        assert result['removed_duplicate_rows'] == 1
+        assert conn.execute('SELECT COUNT(*) FROM candidates').fetchone()[0] == 1
+        assert conn.execute('SELECT id FROM candidates').fetchone()[0] == protected_id
+        assert conn.execute('SELECT COUNT(*) FROM discord_messages WHERE candidate_id=?', (protected_id,)).fetchone()[0] == 1
+        assert conn.execute('SELECT COUNT(*) FROM embeddings WHERE entity_id=?', (duplicate_id,)).fetchone()[0] == 0

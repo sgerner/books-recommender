@@ -227,6 +227,23 @@ def upsert_read_event(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
 
 
 def upsert_candidate(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
+    incoming_raw = row.get('raw')
+    if not isinstance(incoming_raw, dict):
+        incoming_raw = {}
+    existing_raw_row = conn.execute(
+        'SELECT raw_json FROM candidates WHERE source=? AND source_uid=?',
+        (row['source'], row['source_uid']),
+    ).fetchone()
+    if existing_raw_row and existing_raw_row['raw_json']:
+        try:
+            existing_raw = json.loads(existing_raw_row['raw_json'])
+        except (TypeError, ValueError):
+            existing_raw = {}
+        if isinstance(existing_raw, dict):
+            # Source rescans usually carry only source fields. Preserve
+            # enrichment and repair provenance instead of erasing it.
+            row = {**row, 'raw': {**existing_raw, **incoming_raw}}
+
     cur = conn.execute(
         """
         INSERT INTO candidates (
@@ -244,7 +261,7 @@ def upsert_candidate(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
           raw_json=excluded.raw_json,
           score=COALESCE(excluded.score, candidates.score),
           score_breakdown=COALESCE(excluded.score_breakdown, candidates.score_breakdown),
-          status=CASE WHEN candidates.status IN ('approved', 'rejected', 'imported') THEN candidates.status ELSE COALESCE(excluded.status, candidates.status) END,
+          status=CASE WHEN candidates.status IN ('approved', 'rejected', 'imported', 'discord_pending') THEN candidates.status ELSE COALESCE(excluded.status, candidates.status) END,
           librarr_id=COALESCE(excluded.librarr_id, candidates.librarr_id),
           decided_at=COALESCE(excluded.decided_at, candidates.decided_at),
           updated_at=CURRENT_TIMESTAMP

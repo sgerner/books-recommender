@@ -263,6 +263,19 @@ def _parse_json_ld_blocks(scripts: list[dict[str, str]]) -> list[dict[str, Any]]
     return out
 
 
+def _structured_author(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get('name') or '').strip()
+    if isinstance(value, list):
+        names = []
+        for entry in value:
+            name = _structured_author(entry)
+            if name and name not in names:
+                names.append(name)
+        return ', '.join(names)
+    return str(value or '').strip()
+
+
 def _normalize_candidate(candidate: dict[str, Any], source: dict[str, Any], source_uid: str) -> dict[str, Any]:
     candidate = dict(candidate)
     candidate.setdefault('source', source.get('name', 'source'))
@@ -433,11 +446,7 @@ def _candidates_from_json_ld(blocks: list[dict[str, Any]], source: dict[str, Any
                     if not isinstance(book, dict):
                         continue
                     title = book.get('name') or book.get('headline') or book.get('title') or ''
-                    author = ''
-                    if isinstance(book.get('author'), dict):
-                        author = book['author'].get('name') or ''
-                    elif isinstance(book.get('author'), str):
-                        author = book.get('author') or ''
+                    author = _structured_author(book.get('author'))
                     url = book.get('url') or ''
                     desc = book.get('description') or item.get('description') or ''
                     out.append(_normalize_candidate({
@@ -452,11 +461,7 @@ def _candidates_from_json_ld(blocks: list[dict[str, Any]], source: dict[str, Any
                 idx += 1
             elif 'book' in item_type:
                 title = item.get('name') or item.get('headline') or item.get('title') or ''
-                author = ''
-                if isinstance(item.get('author'), dict):
-                    author = item['author'].get('name') or ''
-                elif isinstance(item.get('author'), str):
-                    author = item.get('author') or ''
+                author = _structured_author(item.get('author'))
                 if title and author:
                     out.append(_normalize_candidate({
                         'title': str(title).strip(),
@@ -538,14 +543,20 @@ def discover_source_items(source: dict[str, Any], cfg: dict[str, Any]) -> Source
             digest = _sha256(raw)
             if digest == (source.get('last_hash') or ''):
                 return SourceFetchResult(source=source, items=[], content_hash=digest, skipped=True, reason='unchanged feed')
-            items = normalized_feed_items(url)
+            items = normalized_feed_items(url, raw=raw)
             out: list[dict[str, Any]] = []
             for idx, item in enumerate(items, 1):
-                uid = item.get('guid') or item.get('link') or f"{source.get('name','source')}:{idx}"
+                goodreads_id = str(item.get('goodreads_id') or '').strip()
+                uid = (
+                    f'goodreads:{goodreads_id}'
+                    if goodreads_id
+                    else item.get('guid') or item.get('link') or f"{source.get('name','source')}:{idx}"
+                )
+                book_url = item.get('url') or item.get('link') or ''
                 out.append({
                     'title': item.get('title', '') or source.get('name', ''),
                     'author': item.get('author', ''),
-                    'url': item.get('link') or item.get('url') or '',
+                    'url': book_url,
                     'cover_url': item.get('cover_url', ''),
                     'description': item.get('summary_html') or '',
                     'published_at': item.get('published_at'),

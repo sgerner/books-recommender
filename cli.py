@@ -39,26 +39,6 @@ def _candidate_dict(row):
     }
 
 
-def _candidate_dict(row):
-    raw = json.loads(row['raw_json']) if row['raw_json'] else {}
-    return {
-        'id': row['id'],
-        'source': row['source'],
-        'source_uid': row['source_uid'],
-        'title': row['title'],
-        'author': row['author'],
-        'url': row['url'],
-        'cover_url': row['cover_url'],
-        'media_type': row['media_type'] or 'audiobook',
-        'published_at': row['published_at'],
-        'description': row['description'] or '',
-        'raw': raw,
-        'score': row['score'],
-        'score_breakdown': json.loads(row['score_breakdown']) if row['score_breakdown'] else {},
-        'status': row['status'],
-    }
-
-
 def _goodreads_id_for_candidate(row: dict[str, Any]) -> str:
     raw = row.get('raw') or {}
     if isinstance(raw, dict) and raw.get('goodreads_id'):
@@ -555,9 +535,9 @@ def _candidate_match_keys(conn) -> set[str]:
 def _dedupe_candidates(conn) -> dict[str, int]:
     """Drop redundant candidates: already-read books and duplicate source rows.
 
-    Keeps only the richest/highest-scored row for a candidate title+author. This
-    is intentionally candidate-only; books use stricter dedupe to avoid merging
-    distinct volumes.
+    Keeps only the richest/highest-scored row for an unreferenced candidate
+    title+author. Rows with workflow history are retained so feedback and
+    Discord messages never become orphaned.
     """
     rows = [dict(r) for r in conn.execute('SELECT * FROM candidates').fetchall()]
     book_keys = _candidate_match_keys(conn)
@@ -566,8 +546,23 @@ def _dedupe_candidates(conn) -> dict[str, int]:
         key = normalize_candidate_match_key(row.get('title') or '', row.get('author') or '')
         groups.setdefault(key, []).append(row)
 
+    protected_ids = {
+        int(row['candidate_id'])
+        for row in conn.execute(
+            """
+            SELECT candidate_id FROM discord_messages
+            UNION
+            SELECT candidate_id FROM feedback WHERE candidate_id IS NOT NULL
+            """
+        ).fetchall()
+    }
+    terminal_statuses = {'approved', 'rejected', 'imported', 'discord_pending'}
+
+    def protected(row: dict) -> bool:
+        return row.get('status') in terminal_statuses or int(row['id']) in protected_ids
+
     def richness(row: dict) -> tuple:
-        status_rank = {'approved': 5, 'imported': 5, 'new': 4, 'rejected': 2, 'excluded': 1}.get(row.get('status'), 0)
+        status_rank = {'approved': 5, 'imported': 5, 'discord_pending': 4, 'new': 4, 'rejected': 2, 'excluded': 1}.get(row.get('status'), 0)
         score = row.get('score') if row.get('score') is not None else -1
         audiobook = 1 if str(row.get('media_type') or '').lower() == 'audiobook' else 0
         return (status_rank, float(score), audiobook, len(row.get('description') or ''), 1 if row.get('url') else 0, -int(row['id']))
@@ -575,18 +570,30 @@ def _dedupe_candidates(conn) -> dict[str, int]:
     delete_ids: list[int] = []
     removed_library_matches = 0
     removed_duplicate_rows = 0
-    for key, group in groups.items():
+    for group in groups.values():
         if any(candidate_match_keys(r.get('title') or '', r.get('author') or '', r.get('source') or '') & book_keys for r in group):
-            delete_ids.extend(int(r['id']) for r in group)
-            removed_library_matches += len(group)
+            doomed = [r for r in group if not protected(r)]
+            delete_ids.extend(int(r['id']) for r in doomed)
+            removed_library_matches += len(doomed)
             continue
         if len(group) > 1:
-            keep = max(group, key=richness)
-            doomed = [int(r['id']) for r in group if int(r['id']) != int(keep['id'])]
-            delete_ids.extend(doomed)
+            protected_rows = [r for r in group if protected(r)]
+            if protected_rows:
+                # Keep every referenced/terminal row for auditability; only
+                # unreferenced duplicates are safe to remove.
+                doomed = [r for r in group if not protected(r)]
+            else:
+                keep = max(group, key=richness)
+                doomed = [r for r in group if int(r['id']) != int(keep['id'])]
+            delete_ids.extend(int(r['id']) for r in doomed)
             removed_duplicate_rows += len(doomed)
     if delete_ids:
-        conn.execute('DELETE FROM candidates WHERE id IN (%s)' % ','.join('?' for _ in delete_ids), delete_ids)
+        placeholders = ','.join('?' for _ in delete_ids)
+        conn.execute(
+            f"DELETE FROM embeddings WHERE entity_type='candidate' AND entity_id IN ({placeholders})",
+            delete_ids,
+        )
+        conn.execute(f'DELETE FROM candidates WHERE id IN ({placeholders})', delete_ids)
         conn.commit()
     return {'removed_library_matches': removed_library_matches, 'removed_duplicate_rows': removed_duplicate_rows, 'deleted': len(delete_ids)}
 
@@ -869,6 +876,10 @@ def _repair_historical_goodreads_candidates(
         doomed = [row['id'] for row in group if row['id'] != keep['id']]
         if doomed:
             placeholders = ','.join('?' for _ in doomed)
+            conn.execute(
+                f"DELETE FROM embeddings WHERE entity_type='candidate' AND entity_id IN ({placeholders})",
+                doomed,
+            )
             conn.execute(f'DELETE FROM candidates WHERE id IN ({placeholders})', doomed)
             stats['duplicate_rows_removed'] += len(doomed)
         conn.execute(

@@ -61,10 +61,22 @@ def _child_text(elem: ET.Element, name: str) -> str:
 def _first_author_text(elem: ET.Element) -> str:
     """Read common RSS/Atom author fields, including nested Atom ``name``."""
     for child in list(elem):
-        if _local_name(child.tag) in {'author_name', 'creator', 'author'}:
+        local_name = _local_name(child.tag)
+        if local_name not in {'author_name', 'creator', 'author'}:
+            continue
+        if local_name == 'author':
+            # Atom author elements commonly contain name plus email/URI.
+            # Prefer the semantic name field instead of concatenating every
+            # descendant into a value such as ``Jane Doejane@example.com``.
+            name = next(
+                (nested for nested in child.iter() if _local_name(nested.tag) == 'name'),
+                None,
+            )
+            value = ''.join(name.itertext()).strip() if name is not None else ''.join(child.itertext()).strip()
+        else:
             value = ''.join(child.itertext()).strip()
-            if value:
-                return value
+        if value:
+            return value
     return ''
 
 
@@ -80,14 +92,15 @@ def parse_datetime(value: str | None) -> str | None:
         return value
 
 
-def parse_feed(url: str) -> list[dict[str, Any]]:
-    raw, _ = fetch_url(url)
+def parse_feed(url: str, raw: bytes | None = None) -> list[dict[str, Any]]:
+    if raw is None:
+        raw, _ = fetch_url(url)
     text = raw.decode('utf-8', 'replace')
     text = _sanitize_xml_text(text)
     root = ET.fromstring(text)
-    channel = root.find('./channel')
+    channel = next((child for child in list(root) if _local_name(child.tag) == 'channel'), None)
     if channel is not None:
-        entries = channel.findall('./item')
+        entries = [child for child in list(channel) if _local_name(child.tag) == 'item']
         return [parse_item(item) for item in entries]
     entries = [e for e in root if _local_name(e.tag) == 'entry']
     return [parse_atom_entry(e) for e in entries]
@@ -203,8 +216,8 @@ def _split_title_author(title: str) -> tuple[str, str]:
     return title, ''
 
 
-def normalized_feed_items(url: str) -> list[dict[str, Any]]:
-    items = parse_feed(url)
+def normalized_feed_items(url: str, raw: bytes | None = None) -> list[dict[str, Any]]:
+    items = parse_feed(url, raw=raw)
     out: list[dict[str, Any]] = []
     non_author_categories = {
         'audio-books', 'audiobooks', 'fiction', 'nonfiction', 'non-fiction',
